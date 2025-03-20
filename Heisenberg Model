@@ -1,0 +1,332 @@
+import random  
+import math
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+from numba import njit, prange
+
+# ------------------------------
+# PARAMETERS
+# ------------------------------
+L = 25                   # lattice size: 25 x 25 x 25
+NUM_CONFIG = 10000       # number of configurations for training
+SOM_MAP_ROWS = 15
+SOM_MAP_COLS = 15
+NUM_NEURONS = SOM_MAP_ROWS * SOM_MAP_COLS  # 225 neurons
+DIM_WEIGHTS = L**3 * 3   # each flattened configuration has 25^3 * 3 elements
+
+# ------------------------------
+# FUNCTIONS TO GENERATE THE 3D HEISENBERG MODEL DATASET (using Numba)
+# ------------------------------
+
+def intro():
+    print("This program generates configurations for the 3D Heisenberg model (25x25x25)")
+    print("thermalized at random temperatures for training signals and at fixed temperatures for test signals.")
+    print("Phase 1: 10,000 configurations for T ∈ [0,8] for training (scatter plot of m vs. T).")
+    print("Phase 2: Training of a SOM (15x15) using the batch method.")
+    print("Phase 3: Generation of test signals at fixed temperatures (1000 configurations each).")
+    print("Phase 4: For each signal, count the distinct neurons activated by the SOM and plot activation vs. T.\n")
+
+def random_val():
+    return random.random()
+
+def spin():
+    """
+    Returns a normalized random 3D vector (spin for the Heisenberg model).
+    """
+    v = np.random.randn(3)
+    return v / np.linalg.norm(v)
+
+def initialize_grids_array(n, L):
+    """
+    Initializes an array of configurations with random spins.
+    Returns a NumPy array of shape (n, L, L, L, 3).
+    """
+    lattice = np.random.randn(n, L, L, L, 3)
+    norms = np.linalg.norm(lattice, axis=4, keepdims=True)
+    lattice = lattice / norms
+    return lattice
+
+def assign_temperatures_array(n, tmax):
+    """
+    Returns an array of n random temperatures in [0, tmax].
+    """
+    return np.random.rand(n) * tmax
+
+@njit
+def metropolis_numba(lattice, T, Steps, delta):
+    """
+    Metropolis-Hastings optimized with Numba: thermalizes the lattice configurations.
+    lattice: array of shape (n, L, L, L, 3)
+    T: array of temperatures (length n)
+    """
+    n = lattice.shape[0]
+    L = lattice.shape[1]
+    J = 1.0
+    for instance in range(n):
+        if T[instance] > 0:
+            beta = 1.0 / T[instance]
+        else:
+            beta = 1e10  # use a very large number instead of infinity
+        for sweep in range(Steps):
+            for i in range(L):
+                for j in range(L):
+                    for k in range(L):
+                        s_old = lattice[instance, i, j, k].copy()
+                        random_vec = np.random.randn(3)
+                        s_new = s_old + delta * random_vec
+                        norm = 0.0
+                        for d in range(3):
+                            norm += s_new[d] * s_new[d]
+                        norm = math.sqrt(norm)
+                        for d in range(3):
+                            s_new[d] = s_new[d] / norm
+                        # Periodic boundary conditions
+                        ip = (i+1) % L
+                        im = (i-1) % L
+                        jp = (j+1) % L
+                        jm = (j-1) % L
+                        kp = (k+1) % L
+                        km = (k-1) % L
+                        sum_neighbors = np.empty(3)
+                        for d in range(3):
+                            sum_neighbors[d] = (lattice[instance, ip, j, k, d] +
+                                                lattice[instance, im, j, k, d] +
+                                                lattice[instance, i, jp, k, d] +
+                                                lattice[instance, i, jm, k, d] +
+                                                lattice[instance, i, j, kp, d] +
+                                                lattice[instance, i, j, km, d])
+                        E_old = 0.0
+                        E_new = 0.0
+                        for d in range(3):
+                            E_old += s_old[d] * sum_neighbors[d]
+                            E_new += s_new[d] * sum_neighbors[d]
+                        E_old = -J * E_old
+                        E_new = -J * E_new
+                        dE = E_new - E_old
+                        if T[instance] == 0:
+                            if dE <= 0:
+                                for d in range(3):
+                                    lattice[instance, i, j, k, d] = s_new[d]
+                        else:
+                            if dE <= 0:
+                                for d in range(3):
+                                    lattice[instance, i, j, k, d] = s_new[d]
+                            else:
+                                if np.random.rand() < math.exp(-beta * dE):
+                                    for d in range(3):
+                                        lattice[instance, i, j, k, d] = s_new[d]
+    return lattice
+
+@njit
+def average_magnetization_numba(lattice):
+    """
+    Efficiently calculates the average magnetization.
+    Returns an array m of length n, where m[instance] = || average spin ||.
+    """
+    n = lattice.shape[0]
+    L = lattice.shape[1]
+    m = np.empty(n)
+    total_sites = L ** 3
+    for instance in range(n):
+        total = np.zeros(3)
+        for i in range(L):
+            for j in range(L):
+                for k in range(L):
+                    for d in range(3):
+                        total[d] += lattice[instance, i, j, k, d]
+        norm = 0.0
+        for d in range(3):
+            norm += total[d] * total[d]
+        norm = math.sqrt(norm)
+        m[instance] = norm / total_sites
+    return m
+
+def generate_dataset(n, Steps, tmax, L=L, delta=0.1):
+    """
+    Generates n thermalized configurations of the 3D Heisenberg model.
+    Each configuration is a 3D lattice (LxLxL) with 3D spins.
+    The average magnetization is calculated and the configuration is flattened
+    for subsequent processing (e.g., SOM training).
+    """
+    T = assign_temperatures_array(n, tmax)
+    lattice = initialize_grids_array(n, L)
+    lattice = metropolis_numba(lattice, T, Steps, delta)
+    m = average_magnetization_numba(lattice)
+    data = lattice.reshape(n, L**3 * 3)
+    return T, m, data
+
+def generate_fixed_dataset(n, Steps, T_fixed, L=L, delta=0.1):
+    """
+    Generates n configurations of the 3D Heisenberg model thermalized at a fixed temperature T_fixed.
+    """
+    T = T_fixed * np.ones(n)
+    lattice = initialize_grids_array(n, L)
+    lattice = metropolis_numba(lattice, T, Steps, delta)
+    m = average_magnetization_numba(lattice)
+    data = lattice.reshape(n, L**3 * 3)
+    return T, m, data
+
+# ------------------------------
+# FUNCTIONS FOR TRAINING THE SOM (BATCH METHOD) USING NUMBA (OPTIMIZED)
+# ------------------------------
+
+@njit(parallel=True)
+def initialize_neurons_numba():
+    neurons = np.empty((NUM_NEURONS, DIM_WEIGHTS))
+    for i in prange(NUM_NEURONS):
+        for j in range(DIM_WEIGHTS):
+            if np.random.rand() < 0.5:
+                neurons[i, j] = -1.0
+            else:
+                neurons[i, j] = 1.0
+    return neurons
+
+@njit
+def compute_distance(vec1, vec2):
+    s = 0.0
+    for i in range(vec1.shape[0]):
+        diff = vec1[i] - vec2[i]
+        s += diff * diff
+    return math.sqrt(s)
+
+@njit(parallel=True)
+def find_bmu_numba(neurons, input_signal):
+    n_neurons = neurons.shape[0]
+    best_idx = 0
+    best_dist = compute_distance(input_signal, neurons[0])
+    for i in prange(1, n_neurons):
+        d = compute_distance(input_signal, neurons[i])
+        if d < best_dist:
+            best_dist = d
+            best_idx = i
+    return best_idx
+
+@njit(parallel=True)
+def update_neurons_numba(neurons, signals, bmu_indices, s, learning_rate):
+    n_samples = signals.shape[0]
+    n_neurons = neurons.shape[0]
+    new_weights = np.zeros_like(neurons)
+    for i in prange(n_neurons):
+        total_influence = 0.0
+        for sample in range(n_samples):
+            diff = abs(bmu_indices[sample] - i)
+            h = math.exp(- (diff * diff) / (2 * s * s))
+            total_influence += h
+            for w in range(DIM_WEIGHTS):
+                new_weights[i, w] += h * signals[sample, w]
+        if total_influence > 0:
+            for w in range(DIM_WEIGHTS):
+                new_weights[i, w] /= total_influence
+    for i in prange(n_neurons):
+        for w in range(DIM_WEIGHTS):
+            neurons[i, w] = neurons[i, w] * (1 - learning_rate) + new_weights[i, w] * learning_rate
+    return neurons
+
+def train_SOM_batch_numba(training_data, s0=1.0, initial_step=7, learning_rate=0.1):
+    n_samples = training_data.shape[0]
+    signals = training_data  # signals of shape (n_samples, DIM_WEIGHTS)
+    neurons = initialize_neurons_numba()  # shape (NUM_NEURONS, DIM_WEIGHTS)
+    step = initial_step
+    s = step * s0 + 0.5
+    bmu_indices = np.empty(n_samples, dtype=np.int64)
+    print("Batch training of the SOM (Numba) successfully initialized.")
+    while step > 3:
+        for i in range(n_samples):
+            bmu_indices[i] = find_bmu_numba(neurons, signals[i])
+        neurons = update_neurons_numba(neurons, signals, bmu_indices, s, learning_rate)
+        step -= 1
+        s = step * s0 + 0.5
+        print("Batch iteration completed, current step =", step)
+    print("Batch training of the SOM completed.")
+    som_weights = neurons.reshape(SOM_MAP_ROWS, SOM_MAP_COLS, DIM_WEIGHTS)
+    return som_weights
+
+# ------------------------------
+# FUNCTIONS TO GENERATE TEST SIGNALS AT FIXED TEMPERATURES
+# ------------------------------
+
+def get_fixed_temperatures():
+    fixed = []
+    fixed += list(np.arange(0, 1.2, 0.1))
+    fixed += list(np.arange(1.2, 1.3, 0.01))
+    fixed += list(np.arange(1.3, 1.5, 0.005))
+    fixed += list(np.arange(1.5, 2, 0.01))
+    fixed += list(np.arange(2, 5, 0.1))
+    fixed += list(np.arange(5, 10, 0.2))
+    fixed += list(np.arange(10, 20.1, 0.5))
+    return np.array(fixed)
+
+def generate_test_signals_fixed(n_conf_per_signal, Steps, L=L, delta=0.1):
+    fixed_temps = get_fixed_temperatures()
+    test_signals = []
+    for T_fixed in fixed_temps:
+        _, _, data = generate_fixed_dataset(n_conf_per_signal, Steps, T_fixed, L, delta)
+        test_signals.append(data)
+    return fixed_temps, np.array(test_signals)
+
+def evaluate_signal(som_weights, signal_data, map_height=15, map_width=15):
+    n_conf = signal_data.shape[0]
+    bmu_set = set()
+    def find_bmu(x, weights):
+        diff = weights - x
+        dist_sq = np.sum(diff**2, axis=2)
+        return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
+    for s in range(n_conf):
+        bmu = find_bmu(signal_data[s], som_weights)
+        i, j = bmu
+        bmu_idx = i * map_width + j
+        bmu_set.add(bmu_idx)
+    return len(bmu_set)
+
+# ------------------------------
+# MAIN
+# ------------------------------
+
+def main():
+    intro()
+    random.seed(int(time.time()))
+    print("=== Phase 1: Generation of the training dataset ===")
+    n_train = 10000
+    Steps = 100
+    tmax = 8  # temperature range for training
+    delta = 0.1
+    T_train, m_train, training_data = generate_dataset(n_train, Steps, tmax, L, delta)
+    print(f"Training dataset generated with {len(T_train)} configurations.")
+    plt.figure()
+    plt.scatter(T_train, m_train, c='blue', marker='o', s=5, alpha=0.7)
+    plt.xlabel("Temperature T")
+    plt.ylabel("Magnetization m")
+    plt.title("Training data")
+    plt.grid(True)
+    plt.show()
+
+    print("=== Phase 2: Training the SOM ===")
+    som_weights = train_SOM_batch_numba(training_data)
+
+    print("=== Phase 3: Generation of test signals at fixed temperatures ===")
+    n_conf_per_signal = 1000
+    T_test, test_signals = generate_test_signals_fixed(n_conf_per_signal, Steps, L, delta)
+    print(f"Generated {len(T_test)} test signals (each with up to {n_conf_per_signal} configurations).")
+
+    print("=== Phase 4: Evaluating neural activity per signal ===")
+    activated_neurons = []
+    for idx, signal_data in enumerate(test_signals):
+        count = evaluate_signal(som_weights, signal_data, map_height=15, map_width=15)
+        activated_neurons.append(count)
+    activated_neurons = np.array(activated_neurons)
+    # Calculate the fraction of activated neurons (out of 225)
+    fraction_activated = activated_neurons / 225.0
+    indices = np.argsort(T_test)
+    T_test_sorted = T_test[indices]
+    fraction_sorted = fraction_activated[indices]
+    plt.figure()
+    plt.plot(T_test_sorted, fraction_sorted, marker='o', linestyle='-')
+    plt.xlabel("Signal temperature")
+    plt.ylabel("Fraction of activated neurons")
+    plt.title("Neural activity")
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
