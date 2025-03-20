@@ -1,0 +1,516 @@
+import random
+import math
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ------------------------------
+# FUNCTIONS FOR GENERATING THE ISING DATASET
+# ------------------------------
+
+def incipit():
+    print("The program generates thermalized Ising configurations (25x25) at random temperatures for training")
+    print("and test signals at fixed temperatures (142 + 29 temperatures, 300 configurations each).")
+    print("Phase 1: 10,000 configurations at T ∈ [0,8] for training (scatter plot m vs. T).")
+    print("Phase 2: Training of a SOM (15x15) using the batch method (new logic).")
+    print("Phase 3: Generation of test signals at fixed temperatures (300 configurations each).")
+    print("Phase 4: For each signal, the distinct neurons activated by the SOM are counted and a plot of the percentage of activated neurons vs. T is drawn.\n")
+
+def caso():
+    return random.random()
+
+def spin():
+    return 1 if caso() > 0.5 else -1
+
+def griglie(ising, n, N, M):
+    for istanza in range(n):
+        for i in range(N):
+            for j in range(M):
+                ising[istanza][i][j] = spin()
+
+def temperature(T, n, tmax):
+    for i in range(n):
+        T[i] = caso() * tmax
+
+def bordo(Plus, Minus, N):
+    for i in range(N):
+        Plus[i] = i + 1
+        Minus[i] = i - 1
+    Plus[N - 1] = 0
+    Minus[0] = N - 1
+
+def metropolis(ising, Plus, Minus, T, n, N, M, Steps):
+    for istanza in range(n):
+        beta = 1.0 / T[istanza]
+        for sweep in range(Steps):
+            for i in range(N):
+                for j in range(M):
+                    sito1 = ising[istanza][i][j]
+                    sito2 = -sito1
+                    dx = ising[istanza][Plus[i]][j]
+                    sx = ising[istanza][Minus[i]][j]
+                    up = ising[istanza][i][Minus[j]]
+                    down = ising[istanza][i][Plus[j]]
+                    somma = dx + sx + up + down
+                    e1 = -sito1 * somma
+                    e2 = -sito2 * somma
+                    delta = e2 - e1
+                    if delta <= 0:
+                        ising[istanza][i][j] = sito2
+                    else:
+                        r = caso()
+                        y = -beta * delta
+                        P = math.exp(y)
+                        if r <= P:
+                            ising[istanza][i][j] = sito2
+
+def magnetizzazione_media(m, ising, n, N, M):
+    tot_siti = N * M
+    for istanza in range(n):
+        somma = 0
+        for i in range(N):
+            for j in range(M):
+                somma += ising[istanza][i][j]
+        m[istanza] = float(somma) / tot_siti
+
+def filtra_configurazioni(T, m, data):
+    mask = ~((T >= 0) & (T <= 2) & (m >= -0.85) & (m <= 0.85))
+    return T[mask], m[mask], data[mask]
+
+def genera_dataset(n, Steps, tmax, N=25, M=25):
+    T = [0.0] * 10000
+    m = [0.0] * 10000
+    Plus = [0] * 100
+    Minus = [0] * 100
+    bordo(Plus, Minus, N)
+    temperature(T, n, tmax)
+    ising = []
+    for _ in range(n):
+        config = [[0 for _ in range(M)] for _ in range(N)]
+        ising.append(config)
+    griglie(ising, n, N, M)
+    metropolis(ising, Plus, Minus, T, n, N, M, Steps)
+    magnetizzazione_media(m, ising, n, N, M)
+    data = np.array([np.array(config).flatten().astype(float) for config in ising])
+    T = np.array(T[:n])
+    m = np.array(m[:n])
+    T, m, data = filtra_configurazioni(T, m, data)
+    return T, m, data
+
+def genera_dataset_fisso(n, Steps, T_fixed, N=25, M=25):
+    T = [T_fixed] * n
+    m = [0.0] * n
+    Plus = [0] * 100
+    Minus = [0] * 100
+    bordo(Plus, Minus, N)
+    ising = []
+    for _ in range(n):
+        config = [[0 for _ in range(M)] for _ in range(N)]
+        ising.append(config)
+    griglie(ising, n, N, M)
+    metropolis(ising, Plus, Minus, T, n, N, M, Steps)
+    magnetizzazione_media(m, ising, n, N, M)
+    data = np.array([np.array(config).flatten().astype(float) for config in ising])
+    T = np.array(T)
+    m = np.array(m)
+    T, m, data = filtra_configurazioni(T, m, data)
+    return T, m, data
+
+# ------------------------------
+# CLASSES AND FUNCTIONS FOR SOM TRAINING (BATCH METHOD)
+# (Logic inspired by the second program)
+# ------------------------------
+
+NUM_NEURONI = 225   # 15 x 15
+DIM_PESI = 625      # dimension of the weights per neuron
+
+class Neuron:
+    def __init__(self, x, y, pesi):
+        self.x = x
+        self.y = y
+        self.pesi = pesi[:]
+        self.distanza = 0.0
+        self.flag = 0
+
+class Signal:
+    def __init__(self, ising):
+        self.ising = ising[:]
+
+class BestUnitMatch:
+    def __init__(self, X=0, Y=0, Pesi=None):
+        self.X = X
+        self.Y = Y
+        self.Pesi = Pesi[:] if Pesi is not None else [0.0] * DIM_PESI
+
+def spin_som():
+    return -1.0 if random.randrange(2) == 0 else 1.0
+
+def init_neurons():
+    neurons = []
+    for i in range(15):
+        for j in range(15):
+            weights = [spin_som() for _ in range(DIM_PESI)]
+            neurons.append(Neuron(x=i, y=j, pesi=weights))
+    return neurons
+
+def bestmatch(neurons, input_signal):
+    n = len(neurons)
+    for neuron in neurons:
+        diff_sq_sum = sum((inp - w) ** 2 for inp, w in zip(input_signal.ising, neuron.pesi))
+        neuron.distanza = math.sqrt(diff_sq_sum)
+    bingo = random.randrange(n)
+    for i in range(n):
+        if neurons[i].distanza < neurons[bingo].distanza:
+            bingo = i
+    lulla = 0
+    for neuron in neurons:
+        if neuron.distanza == neurons[bingo].distanza:
+            neuron.flag = 1
+            lulla += 1
+        else:
+            neuron.flag = 0
+    bongo = random.randrange(lulla) + 1
+    lello = 0
+    best_index = None
+    i = 0
+    while True:
+        if neurons[i].flag == 1:
+            lello += 1
+            if lello == bongo:
+                best_index = i
+                break
+        i += 1
+    best_neuron = neurons[best_index]
+    return BestUnitMatch(X=best_neuron.x, Y=best_neuron.y, Pesi=best_neuron.pesi)
+
+def raggio(neuron, bmu):
+    L = 15
+    i = bmu.X
+    j = bmu.Y
+    k = neuron.x
+    l = neuron.y
+    if i <= k:
+        a1 = (k - i) ** 2
+        a2 = (i + L - k) ** 2
+        a = a1 if a1 < a2 else a2
+    else:
+        a1 = (k - i) ** 2
+        a2 = (i - L - k) ** 2
+        a = a1 if a1 < a2 else a2
+    if j <= l:
+        b1 = (l - j) ** 2
+        b2 = (j + L - l) ** 2
+        b = b1 if b1 < b2 else b2
+    else:
+        b1 = (l - j) ** 2
+        b2 = (j - L - l) ** 2
+        b = b1 if b1 < b2 else b2
+    r = math.sqrt(a + b)
+    return r
+
+def vicinato(neuron, bmu, s):
+    r1 = raggio(neuron, bmu)
+    r_sq = r1 * r1
+    d = 2 * s * s
+    h = math.exp(-r_sq / d)
+    return h
+
+def train_SOM_batch(training_data, s0=1.0, initial_step=7):
+    n_samples = training_data.shape[0]
+    signals = [Signal(ising=list(training_data[i])) for i in range(n_samples)]
+    neurons = init_neurons()
+    bmu_list = [None] * n_samples
+    h_matrix = [[0.0 for _ in range(NUM_NEURONI)] for _ in range(n_samples)]
+
+    step = initial_step
+    s = step * s0 + 0.5
+    print("SOM batch training initialized correctly.")
+    while step > 3:
+        for i in range(n_samples):
+            bmu_list[i] = bestmatch(neurons, signals[i])
+        for i in range(n_samples):
+            for j in range(NUM_NEURONI):
+                h_matrix[i][j] = vicinato(neurons[j], bmu_list[i], s)
+        for weight_index in range(DIM_PESI):
+            for neuron_index in range(NUM_NEURONI):
+                sum_h = sum(h_matrix[k][neuron_index] for k in range(n_samples))
+                if sum_h == 0:
+                    new_weight = 0
+                else:
+                    sum_h_ising = sum(h_matrix[k][neuron_index] * signals[k].ising[weight_index] for k in range(n_samples))
+                    new_weight = sum_h_ising / sum_h
+                neurons[neuron_index].pesi[weight_index] = new_weight
+        step -= 1
+        s = step * s0 + 0.5
+        print(f"Batch iteration completed, step now = {step}")
+    print("SOM batch training completed.")
+
+    som_weights = np.empty((15, 15, DIM_PESI))
+    for neuron in neurons:
+        som_weights[neuron.x, neuron.y, :] = neuron.pesi
+    return som_weights
+
+# ------------------------------
+# FUNCTIONS FOR GENERATING TEST SIGNALS AT FIXED TEMPERATURES
+# ------------------------------
+
+def get_fixed_temperatures():
+    """
+    Returns a list of fixed temperatures, defined 'by hand'.
+    The first 142 are the original ones, to which an additional 29 values are added.
+    """
+    fixed = [0.0] * 171
+    fixed[0]   = 0.050
+    fixed[1]   = 0.100
+    fixed[2]   = 0.150
+    fixed[3]   = 0.200
+    fixed[4]   = 0.250
+    fixed[5]   = 0.300
+    fixed[6]   = 0.350
+    fixed[7]   = 0.400
+    fixed[8]   = 0.450
+    fixed[9]   = 0.500
+    fixed[10]  = 0.550
+    fixed[11]  = 0.600
+    fixed[12]  = 0.650
+    fixed[13]  = 0.700
+    fixed[14]  = 0.750
+    fixed[15]  = 0.800
+    fixed[16]  = 0.850
+    fixed[17]  = 0.900
+    fixed[18]  = 0.950
+    fixed[19]  = 1.000
+    fixed[20]  = 1.050
+    fixed[21]  = 1.100
+    fixed[22]  = 1.150
+    fixed[23]  = 1.200
+    fixed[24]  = 1.250
+    fixed[25]  = 1.300
+    fixed[26]  = 1.350
+    fixed[27]  = 1.400
+    fixed[28]  = 1.450
+    fixed[29]  = 1.500
+    fixed[30]  = 1.550
+    fixed[31]  = 1.600
+    fixed[32]  = 1.650
+    fixed[33]  = 1.700
+    fixed[34]  = 1.750
+    fixed[35]  = 1.800
+    fixed[36]  = 1.850
+    fixed[37]  = 1.900
+    fixed[38]  = 1.950
+    fixed[39]  = 2.000
+    fixed[40]  = 2.050
+    fixed[41]  = 2.100
+    fixed[42]  = 2.150
+    fixed[43]  = 2.200
+    fixed[44]  = 2.210
+    fixed[45]  = 2.220
+    fixed[46]  = 2.230
+    fixed[47]  = 2.240
+    fixed[48]  = 2.250
+    fixed[49]  = 2.260
+    fixed[50]  = 2.268
+    fixed[51]  = 2.269
+    fixed[52]  = 2.270
+    fixed[53]  = 2.271
+    fixed[54]  = 2.280
+    fixed[55]  = 2.290
+    fixed[56]  = 2.300
+    fixed[57]  = 2.310
+    fixed[58]  = 2.350
+    fixed[59]  = 2.400
+    fixed[60]  = 2.450
+    fixed[61]  = 2.500
+    fixed[62]  = 2.550
+    fixed[63]  = 2.600
+    fixed[64]  = 2.650
+    fixed[65]  = 2.700
+    fixed[66]  = 2.750
+    fixed[67]  = 2.800
+    fixed[68]  = 2.850
+    fixed[69]  = 2.900
+    fixed[70]  = 2.950
+    fixed[71]  = 3.000
+    fixed[72]  = 3.050
+    fixed[73]  = 3.100
+    fixed[74]  = 3.150
+    fixed[75]  = 3.200
+    fixed[76]  = 3.250
+    fixed[77]  = 3.300
+    fixed[78]  = 3.350
+    fixed[79]  = 3.400
+    fixed[80]  = 3.450
+    fixed[81]  = 3.500
+    fixed[82]  = 3.550
+    fixed[83]  = 3.600
+    fixed[84]  = 3.650
+    fixed[85]  = 3.700
+    fixed[86]  = 3.750
+    fixed[87]  = 3.800
+    fixed[88]  = 3.850
+    fixed[89]  = 3.900
+    fixed[90]  = 3.950
+    fixed[91]  = 4.000
+    fixed[92]  = 4.050
+    fixed[93]  = 4.100
+    fixed[94]  = 4.150
+    fixed[95]  = 4.200
+    fixed[96]  = 4.250
+    fixed[97]  = 4.300
+    fixed[98]  = 4.350
+    fixed[99]  = 4.400
+    fixed[100] = 4.450
+    fixed[101] = 4.500
+    fixed[102] = 4.550
+    fixed[103] = 4.600
+    fixed[104] = 4.650
+    fixed[105] = 4.700
+    fixed[106] = 4.750
+    fixed[107] = 4.800
+    fixed[108] = 4.850
+    fixed[109] = 4.900
+    fixed[110] = 4.950
+    fixed[111] = 5.000
+    fixed[112] = 5.100
+    fixed[113] = 5.200
+    fixed[114] = 5.300
+    fixed[115] = 5.400
+    fixed[116] = 5.500
+    fixed[117] = 5.600
+    fixed[118] = 5.700
+    fixed[119] = 5.800
+    fixed[120] = 5.900
+    fixed[121] = 6.000
+    fixed[122] = 6.100
+    fixed[123] = 6.200
+    fixed[124] = 6.300
+    fixed[125] = 6.400
+    fixed[126] = 6.500
+    fixed[127] = 6.600
+    fixed[128] = 6.700
+    fixed[129] = 6.800
+    fixed[130] = 6.900
+    fixed[131] = 7.000
+    fixed[132] = 7.100
+    fixed[133] = 7.200
+    fixed[134] = 7.300
+    fixed[135] = 7.400
+    fixed[136] = 7.500
+    fixed[137] = 7.600
+    fixed[138] = 7.700
+    fixed[139] = 7.800
+    fixed[140] = 7.900
+    fixed[141] = 8.000
+    # Added manually defined temperatures:
+    fixed[142] = 8.200
+    fixed[143] = 8.400
+    fixed[144] = 8.600
+    fixed[145] = 8.800
+    fixed[146] = 9.000
+    fixed[147] = 9.200
+    fixed[148] = 9.400
+    fixed[149] = 9.600
+    fixed[150] = 9.800
+    fixed[151] = 10.000
+    fixed[152] = 10.300
+    fixed[153] = 10.600
+    fixed[154] = 10.900
+    fixed[155] = 11.200
+    fixed[156] = 11.500
+    fixed[157] = 11.800
+    fixed[158] = 12.200
+    fixed[159] = 12.600
+    fixed[160] = 13.000
+    fixed[161] = 13.500
+    fixed[162] = 14.000
+    fixed[163] = 14.500
+    fixed[164] = 15.000
+    fixed[165] = 15.500
+    fixed[166] = 16.000
+    fixed[167] = 17.000
+    fixed[168] = 18.000
+    fixed[169] = 19.000
+    fixed[170] = 20.000
+    return fixed
+
+def genera_test_signals_fixed(n_conf_per_signal, Steps, N=25, M=25):
+    fixed_temps = get_fixed_temperatures()
+    test_signals = []
+    for T_fixed in fixed_temps:
+        _, _, data = genera_dataset_fisso(n_conf_per_signal, Steps, T_fixed, N, M)
+        test_signals.append(data)
+    return np.array(fixed_temps), test_signals
+
+# ------------------------------
+# PHASE 4: EVALUATION OF NEURAL ACTIVITY PER SIGNAL
+# ------------------------------
+
+def valuta_segnale(som_weights, signal_data, map_height=15, map_width=15):
+    n_conf = signal_data.shape[0]
+    bmu_set = set()
+    def find_bmu(x, weights):
+        diff = weights - x
+        dist_sq = np.sum(diff**2, axis=2)
+        return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
+    for s in range(n_conf):
+        bmu = find_bmu(signal_data[s], som_weights)
+        i, j = bmu
+        bmu_idx = i * map_width + j
+        bmu_set.add(bmu_idx)
+    return len(bmu_set)
+
+# ------------------------------
+# MAIN
+# ------------------------------
+
+def main():
+    incipit()
+    random.seed(int(time.time()))
+
+    print("=== Phase 1: Generation of the training dataset ===")
+    n_train = 10000
+    Steps = 100
+    T_train, m_train, training_data = genera_dataset(n_train, Steps, tmax=8)
+    print(f"Generated training dataset with {len(T_train)} configurations (after filtering).")
+
+    plt.figure()
+    plt.scatter(T_train, m_train, c='blue', marker='o', s=5, alpha=0.7)
+    plt.xlabel("Temperature T")
+    plt.ylabel("Magnetization m")
+    plt.title("Training data")
+    plt.grid(True)
+    plt.show()
+
+    print("=== Phase 2: SOM Training ===")
+    som_weights = train_SOM_batch(training_data)
+
+    print("=== Phase 3: Generation of test signals at fixed temperatures ===")
+    n_conf_per_signal = 1000
+    T_test, test_signals = genera_test_signals_fixed(n_conf_per_signal, Steps, N=25, M=25)
+    print(f"Generated {len(T_test)} test signals (each with up to {n_conf_per_signal} configurations, filtered if necessary).")
+
+    print("=== Phase 4: Evaluation of neural activity per signal ===")
+    activated_neurons = []
+    for idx, signal_data in enumerate(test_signals):
+        count = valuta_segnale(som_weights, signal_data, map_height=15, map_width=15)
+        activated_neurons.append(count)
+    activated_neurons = np.array(activated_neurons)
+
+    # Calculation of the percentage of activated neurons (total 225 = 15 x 15)
+    activated_percentage = (activated_neurons / 225.0)
+
+    indices = np.argsort(T_test)
+    T_test_sorted = T_test[indices]
+    percentage_sorted = activated_percentage[indices]
+
+    plt.figure()
+    plt.plot(T_test_sorted, percentage_sorted, marker='o', linestyle='-')
+    plt.xlabel("Signal temperature")
+    plt.ylabel("Fraction of activated neurons")
+    plt.title("Neural activity")
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
