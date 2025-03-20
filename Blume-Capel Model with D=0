@@ -1,0 +1,375 @@
+"""
+---------------------
+This program performs four phases for the spin-1 Ising model with D=0:
+1) It generates a dataset of 25×25 configurations thermalized at random temperatures in [0, tmax].
+   For each configuration, the average magnetization is calculated:
+       m(S) = (1/N) Σ s_i,   with s_i ∈ {-1, 0, +1}.
+   A scatter plot (m vs. T) and a lattice heatmap are displayed.
+2) It trains a Self-Organizing Map (SOM 15×15) using the batch method.
+3) It generates test signals at fixed temperatures. The list of 170 temperatures is manually compiled.
+4) For each signal, the number of distinct neurons (unique BMUs) activated by the SOM is calculated.
+   Finally, the graph "Fraction of Activated Neurons vs. Temperature" is plotted.
+
+The model is defined by:
+    H = -J Σ_{<i,j>} s_i s_j + D Σ_i s_i^2,
+with D=0 (and J=1), so that the system shows a continuous transition around T_c ≈ 1.695.
+"""
+
+import random
+import math
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ------------------------------
+# FUNCTIONS FOR GENERATING THE SPIN-1 ISING DATASET (D=0)
+# ------------------------------
+
+def intro():
+    print("The program generates thermalized 25x25 configurations for the spin-1 Ising model at random temperatures for training")
+    print("and test signals at fixed temperatures (170 manually defined temperatures, 300 configurations each).")
+    print("Phase 1: 10,000 configurations at T ∈ [0, tmax] for training (scatter plot m vs. T and heatmap).")
+    print("Phase 2: Training of a SOM (15x15) using the batch method.")
+    print("Phase 3: Generation of test signals at fixed temperatures (manually compiled list).")
+    print("Phase 4: Evaluation of neural activity: plot of fraction of activated neurons vs. Temperature.\n")
+
+def read_input():
+    attempts = 0
+    while True:
+        if attempts == 0:
+            print("Enter the number of configurations to generate for training (integer > 0 and < 10000):")
+        else:
+            print("Error: the number must be an integer > 0 and < 10000. Try again:")
+        try:
+            n = int(input())
+        except ValueError:
+            n = -1
+        attempts += 1
+        if n > 0 and n < 10000:
+            break
+    print()
+    return n
+
+def random_val():
+    return random.random()
+
+def spin1():
+    # Returns -1, 0, or +1 (with equal probability)
+    return random.choice([-1, 0, 1])
+
+def init_grids(ising, n, N, M):
+    for instance in range(n):
+        for i in range(N):
+            for j in range(M):
+                ising[instance][i][j] = spin1()
+
+def set_temperatures(T, n, tmax):
+    for i in range(n):
+        T[i] = random_val() * tmax
+
+def periodic_boundary(Plus, Minus, N):
+    for i in range(N):
+        Plus[i] = i + 1
+        Minus[i] = i - 1
+    Plus[N - 1] = 0
+    Minus[0] = N - 1
+
+def metropolis(ising, Plus, Minus, T, n, N, M, Steps, J, D):
+    # D is fixed to 0 in this case
+    for instance in range(n):
+        beta = 1.0 / T[instance] if T[instance] > 0 else 1.0
+        for sweep in range(Steps):
+            for i in range(N):
+                for j in range(M):
+                    current_spin = ising[instance][i][j]
+                    possibilities = [-1, 0, 1]
+                    possibilities.remove(current_spin)
+                    new_spin = random.choice(possibilities)
+
+                    right = ising[instance][Plus[i]][j]
+                    left = ising[instance][Minus[i]][j]
+                    up = ising[instance][i][Minus[j]]
+                    down = ising[instance][i][Plus[j]]
+                    neighbor_sum = right + left + up + down
+
+                    deltaE = -J * (new_spin - current_spin) * neighbor_sum + D * (new_spin**2 - current_spin**2)
+
+                    if deltaE <= 0:
+                        ising[instance][i][j] = new_spin
+                    else:
+                        if random_val() < math.exp(-beta * deltaE):
+                            ising[instance][i][j] = new_spin
+
+def average_magnetization(m, ising, n, N, M):
+    tot = N * M
+    for instance in range(n):
+        s_sum = 0
+        for i in range(N):
+            for j in range(M):
+                s_sum += ising[instance][i][j]
+        m[instance] = float(s_sum) / tot
+
+def filter_configurations(T, m, data):
+    # Eliminates configurations with temperatures in [0, 1.35] and magnetization in [-0.85, -0.125] or in [0.125, 0.85]
+    mask = ~(((T >= 0) & (T <= 1.35)) & (((m >= -0.85) & (m <= -0.08)) | ((m >= 0.08) & (m <= 0.85))))
+    return T[mask], m[mask], data[mask]
+
+def generate_dataset(n, Steps, tmax, N=25, M=25, J=1.0, D=0.0):
+    T = [0.0] * 10000
+    m = [0.0] * 10000
+    Plus = [0] * N
+    Minus = [0] * N
+    periodic_boundary(Plus, Minus, N)
+    set_temperatures(T, n, tmax)
+    ising = []
+    for _ in range(n):
+        config = [[0 for _ in range(M)] for _ in range(N)]
+        ising.append(config)
+    init_grids(ising, n, N, M)
+    metropolis(ising, Plus, Minus, T, n, N, M, Steps, J, D)
+    average_magnetization(m, ising, n, N, M)
+    data = np.array([np.array(config).flatten().astype(float) for config in ising])
+    T = np.array(T[:n])
+    m = np.array(m[:n])
+    T, m, data = filter_configurations(T, m, data)
+    return T, m, data, ising
+
+def generate_fixed_dataset(n, Steps, T_fixed, N=25, M=25, J=1.0, D=0.0):
+    T = [T_fixed] * n
+    m = [0.0] * n
+    Plus = [0] * N
+    Minus = [0] * N
+    periodic_boundary(Plus, Minus, N)
+    ising = []
+    for _ in range(n):
+        config = [[0 for _ in range(M)] for _ in range(N)]
+        ising.append(config)
+    init_grids(ising, n, N, M)
+    metropolis(ising, Plus, Minus, T, n, N, M, Steps, J, D)
+    average_magnetization(m, ising, n, N, M)
+    data = np.array([np.array(config).flatten().astype(float) for config in ising])
+    T = np.array(T)
+    m = np.array(m)
+    T, m, data = filter_configurations(T, m, data)
+    return T, m, data
+
+# ------------------------------
+# SOM SECTION: CLASSES AND FUNCTIONS FOR BATCH TRAINING
+# (Training operates on vectors of dimension 625)
+# ------------------------------
+
+NUM_NEURONS = 225   # 15x15
+DIM_WEIGHTS = 625
+
+class Neuron:
+    def __init__(self, x, y, weights):
+        self.x = x
+        self.y = y
+        self.weights = weights[:]
+        self.distance = 0.0
+        self.flag = 0
+
+class Signal:
+    def __init__(self, ising):
+        self.ising = ising[:]
+
+class BestUnitMatch:
+    def __init__(self, X=0, Y=0, weights=None):
+        self.X = X
+        self.Y = Y
+        self.weights = weights[:] if weights is not None else [0.0]*DIM_WEIGHTS
+
+def spin_som():
+    return -1.0 if random.randrange(2) == 0 else 1.0
+
+def init_neurons():
+    neurons = []
+    for i in range(15):
+        for j in range(15):
+            weights = [spin_som() for _ in range(DIM_WEIGHTS)]
+            neurons.append(Neuron(x=i, y=j, weights=weights))
+    return neurons
+
+def bestmatch(neurons, input_signal):
+    n = len(neurons)
+    for neuron in neurons:
+        diff_sq_sum = sum((inp - w)**2 for inp, w in zip(input_signal.ising, neuron.weights))
+        neuron.distance = math.sqrt(diff_sq_sum)
+    # Select the neuron with the minimum distance (BMU)
+    bmu_index = random.randrange(n)
+    for i in range(n):
+        if neurons[i].distance < neurons[bmu_index].distance:
+            bmu_index = i
+    best_neuron = neurons[bmu_index]
+    return BestUnitMatch(X=best_neuron.x, Y=best_neuron.y, weights=best_neuron.weights)
+
+def radius(neuron, bmu):
+    L = 15
+    a = min((neuron.x - bmu.X)**2, (abs(neuron.x - bmu.X - L))**2)
+    b = min((neuron.y - bmu.Y)**2, (abs(neuron.y - bmu.Y - L))**2)
+    return math.sqrt(a + b)
+
+def neighborhood(neuron, bmu, s):
+    r_sq = radius(neuron, bmu)**2
+    return math.exp(-r_sq/(2*s*s))
+
+def train_SOM_batch(training_data, s0=1.0, initial_step=7):
+    n_samples = training_data.shape[0]
+    signals = [Signal(ising=list(training_data[i])) for i in range(n_samples)]
+    neurons = init_neurons()
+    bmu_list = [None] * n_samples
+    h_matrix = [[0.0 for _ in range(NUM_NEURONS)] for _ in range(n_samples)]
+
+    step = initial_step
+    s = step * s0 + 0.5
+    print("Batch SOM training initialized correctly.")
+    while step > 3:
+        for i in range(n_samples):
+            bmu_list[i] = bestmatch(neurons, signals[i])
+        for i in range(n_samples):
+            for j in range(NUM_NEURONS):
+                h_matrix[i][j] = neighborhood(neurons[j], bmu_list[i], s)
+        for weight_index in range(DIM_WEIGHTS):
+            for neuron_index in range(NUM_NEURONS):
+                sum_h = sum(h_matrix[k][neuron_index] for k in range(n_samples))
+                if sum_h == 0:
+                    new_weight = 0
+                else:
+                    sum_h_ising = sum(h_matrix[k][neuron_index] * signals[k].ising[weight_index] for k in range(n_samples))
+                    new_weight = sum_h_ising / sum_h
+                neurons[neuron_index].weights[weight_index] = new_weight
+        step -= 1
+        s = step * s0 + 0.5
+        print(f"Batch iteration completed, step now = {step}")
+    print("Batch SOM training completed.")
+    som_weights = np.empty((15, 15, DIM_WEIGHTS))
+    for neuron in neurons:
+        som_weights[neuron.x, neuron.y, :] = neuron.weights
+    return som_weights
+
+# ------------------------------
+# TEST SECTION: GENERATION OF TEST SIGNALS AT FIXED TEMPERATURES
+# ------------------------------
+
+def get_fixed_temperatures():
+    """
+    Manually insert the list of 170 fixed temperatures here.
+    For example, you might generate it with:
+        temps1 = np.arange(0, 1.6+0.1, 0.1)      # from 0 to 1.6 with step 0.1
+        temps2 = np.arange(1.6+0.01, 1.8+0.01, 0.01)  # from 1.61 to 1.8 with step 0.01
+        temps3 = np.arange(1.8+0.1, 5+0.1, 0.1)    # from 1.9 to 5 with step 0.1
+        temps4 = np.arange(5+0.2, 10+0.2, 0.2)     # from 5.2 to 10 with step 0.2
+        temps5 = np.arange(10+0.5, 20+0.5, 0.5)    # from 10.5 to 20 with step 0.5
+        fixed_temps = np.concatenate([temps1, temps2, temps3, temps4, temps5])
+    For now, an example list is returned (modify as desired):
+    """
+    fixed = [0.05, 0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85, 0.95,
+             1.05, 1.15, 1.25, 1.35, 1.45, 1.55, 1.65, 1.66, 1.67, 1.68,
+             1.695, 1.70, 1.71, 1.72, 1.73, 1.74, 1.75, 1.80, 1.90, 2.00,
+             2.10, 2.20, 2.30, 2.40, 2.50, 2.60, 2.70, 2.80, 2.90, 3.00,
+             3.10, 3.20, 3.30, 3.40, 3.50, 3.60, 3.70, 3.80, 3.90, 4.00,
+             4.10, 4.20, 4.30, 4.40, 4.50, 4.60, 4.70, 4.80, 4.90, 5.00,
+             5.20, 5.40, 5.60, 5.80, 6.00, 6.20, 6.40, 6.60, 6.80, 7.00,
+             7.20, 7.40, 7.60, 7.80, 8.00, 8.20, 8.40, 8.60, 8.80, 9.00,
+             9.20, 9.40, 9.60, 9.80, 10.00, 10.20, 10.40, 10.60, 10.80, 11.00,
+             11.20, 11.40, 11.60, 11.80, 12.00, 12.20, 12.40, 12.60, 12.80, 13.00,
+             13.20, 13.40, 13.60, 13.80, 14.00, 14.20, 14.40, 14.60, 14.80, 15.00,
+             15.20, 15.40, 15.60, 15.80, 16.00, 16.50, 17.00, 17.50, 18.00, 18.50,
+             19.00, 19.50, 20.00]
+    return fixed
+
+def generate_test_signals_fixed(n_conf_per_signal, Steps, N=25, M=25, J=1.0, D=0.0):
+    fixed_temps = get_fixed_temperatures()
+    test_signals = []
+    for T_fixed in fixed_temps:
+        _, _, data = generate_fixed_dataset(n_conf_per_signal, Steps, T_fixed, N, M, J, D)
+        test_signals.append(data)
+    return np.array(fixed_temps), test_signals
+
+# ------------------------------
+# PHASE 4: EVALUATION OF NEURAL ACTIVITY PER SIGNAL
+# ------------------------------
+
+def evaluate_signal(som_weights, signal_data, map_height=15, map_width=15):
+    n_conf = signal_data.shape[0]
+    bmu_set = set()
+    def find_bmu(x, weights):
+        diff = weights - x
+        dist_sq = np.sum(diff**2, axis=2)
+        return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
+    for s in range(n_conf):
+        bmu = find_bmu(signal_data[s], som_weights)
+        i, j = bmu
+        bmu_set.add(i * map_width + j)
+    return len(bmu_set)
+
+# ------------------------------
+# MAIN
+# ------------------------------
+
+def main():
+    intro()
+    random.seed(int(time.time()))
+
+    # --- Phase 1: Generation of the training dataset for the spin-1 Ising model (D=0) ---
+    print("=== Phase 1: Generation of the spin-1 Ising training dataset ===")
+    n_train = 10000   # e.g., 10,000 configurations
+    Steps = 100       # number of sweeps per configuration
+    J = 1.0
+    D = 0.0              # For D=0
+    tmax = 8             # Temperature range for training: [0, tmax]
+    T_train, m_train, training_data, train_configurations = generate_dataset(n_train, Steps, tmax, N=25, M=25, J=J, D=D)
+    print(f"Generated training dataset with {n_train} configurations (after filtering).")
+
+    # Scatter plot: Average Magnetization vs. Temperature (Training)
+    plt.figure(figsize=(8,6))
+    plt.scatter(T_train, m_train, c='blue', marker='o', s=5, alpha=0.7)
+    plt.xlabel("Temperature T")
+    plt.ylabel("Magnetization m")
+    plt.title("Training data")
+    plt.grid(True)
+    plt.show()
+
+    # Heatmap: Display of a lattice configuration (first configuration)
+    plt.figure(figsize=(6,6))
+    plt.imshow(train_configurations[0], cmap="bwr", interpolation="nearest")
+    plt.colorbar(label="Spin")
+    plt.title(f"Lattice Configuration\n(Temperature = {T_train[0]:.2f}, m = {m_train[0]:.2f})")
+    plt.show()
+
+    # --- Phase 2: Training the SOM (Batch Method) ---
+    print("=== Phase 2: Training the SOM (Batch Method) ===")
+    som_weights = train_SOM_batch(training_data, s0=1.0, initial_step=7)
+
+    # --- Phase 3: Generation of test signals at fixed temperatures ---
+    print("=== Phase 3: Generation of test signals at fixed temperatures ===")
+    n_conf_per_signal = 1000
+    T_test, test_signals = generate_test_signals_fixed(n_conf_per_signal, Steps, N=25, M=25, J=J, D=D)
+    print(f"Generated {len(T_test)} test signals (each with up to {n_conf_per_signal} configurations, after filtering).")
+
+    # --- Phase 4: Evaluation of neural activity on the test signals ---
+    print("=== Phase 4: Evaluation of neural activity per signal ===")
+    activated_neurons = []
+    for signal_data in test_signals:
+        count = evaluate_signal(som_weights, signal_data, map_height=15, map_width=15)
+        activated_neurons.append(count)
+    activated_neurons = np.array(activated_neurons)
+
+    # Calculate fraction of activated neurons (activated neurons / total neurons)
+    fraction_activated = (activated_neurons / 225.0 )
+
+    # Sort the signals by temperature for the plot
+    indices = np.argsort(T_test)
+    T_test_sorted = T_test[indices]
+    fraction_sorted = fraction_activated[indices]
+
+    plt.figure(figsize=(8,6))
+    plt.plot(T_test_sorted, fraction_sorted, marker='o', linestyle='-')
+    plt.xlabel("Signal temperature")
+    plt.ylabel("Fraction of activated neurons")
+    plt.title("Neural activity")
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
