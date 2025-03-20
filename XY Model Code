@@ -1,0 +1,309 @@
+import random
+import math
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+from numba import njit, prange
+
+# ------------------------------
+# INFORMATION AND PARAMETERS
+# ------------------------------
+def introduction():
+    print("This program generates configurations of the XY model (25x25)")
+    print("thermalized at random temperatures for training and test signals at fixed temperatures.")
+    print("Temperature grid for test signals:")
+    print("  - from 0 to 0.6 with step 0.1")
+    print("  - from 0.6 to 1 with step 0.005")
+    print("  - from 1 to 2 with step 0.1")
+    print("  - from 2 to 8 with step 0.2")
+    print("  - from 8 to 20 with step 0.5")
+    print("For training, for each configuration the helicity modulus γ is computed,")
+    print("which acts as a control parameter (with a universal jump around T≈0.89).")
+    print("Subsequently, a SOM (15×15) is trained and neural activity is evaluated on test signals.\n")
+
+# Grid dimensions for the XY model
+L_xy = 25   # number of rows
+M_xy = 25   # number of columns
+
+# ------------------------------
+# DATASET GENERATION FOR THE XY MODEL (using Numba)
+# ------------------------------
+
+def initialize_configurations(n, L, M):
+    """Generate n configurations, each a (L x M) grid of angles in [0, 2π)."""
+    configurations = np.random.rand(n, L, M) * 2 * math.pi
+    return configurations
+
+def generate_temperatures(n, tmax):
+    """Generate n temperatures uniformly in [0, tmax]."""
+    return np.random.rand(n) * tmax
+
+@njit
+def metropolis_xy_numba(configurations, T_list, Steps, delta_max):
+    """
+    Numba-optimized Metropolis-Hastings for the XY model.
+    configurations: array of shape (n, L, M) containing angles (in radians)
+    T_list: array of temperatures (length n)
+    """
+    n, L, M = configurations.shape
+    for instance in range(n):
+        T_inst = T_list[instance]
+        for sweep in range(Steps):
+            for i in range(L):
+                for j in range(M):
+                    theta_old = configurations[instance, i, j]
+                    # Propose a random change in [-delta_max, delta_max]
+                    delta_angle = (np.random.rand() * 2 - 1) * delta_max
+                    theta_new = (theta_old + delta_angle) % (2 * math.pi)
+                    # Periodic boundaries
+                    ip = (i + 1) % L
+                    im = (i - 1) % L
+                    jp = (j + 1) % M
+                    jm = (j - 1) % M
+                    E_old = - (math.cos(theta_old - configurations[instance, i, jp]) +
+                               math.cos(theta_old - configurations[instance, i, jm]) +
+                               math.cos(theta_old - configurations[instance, ip, j]) +
+                               math.cos(theta_old - configurations[instance, im, j]))
+                    E_new = - (math.cos(theta_new - configurations[instance, i, jp]) +
+                               math.cos(theta_new - configurations[instance, i, jm]) +
+                               math.cos(theta_new - configurations[instance, ip, j]) +
+                               math.cos(theta_new - configurations[instance, im, j]))
+                    dE = E_new - E_old
+                    if dE <= 0 or (T_inst > 0 and np.random.rand() < math.exp(-dE / T_inst)):
+                        configurations[instance, i, j] = theta_new
+    return configurations
+
+@njit
+def helicity_modulus_numba(configurations, T_list):
+    """
+    Numba-optimized calculation of the helicity modulus for each configuration.
+    Returns an array gamma of length n.
+    """
+    n, L, M = configurations.shape
+    gamma = np.empty(n)
+    for instance in range(n):
+        sum_cos_x = 0.0
+        sum_sin2_x = 0.0
+        sum_cos_y = 0.0
+        sum_sin2_y = 0.0
+        for i in range(L):
+            for j in range(M):
+                jp = (j + 1) % M
+                ip = (i + 1) % L
+                diff_x = configurations[instance, i, j] - configurations[instance, i, jp]
+                diff_y = configurations[instance, i, j] - configurations[instance, ip, j]
+                sum_cos_x += math.cos(diff_x)
+                sum_sin2_x += math.sin(diff_x)**2
+                sum_cos_y += math.cos(diff_y)
+                sum_sin2_y += math.sin(diff_y)**2
+        N_b = L * M
+        T_inst = T_list[instance] if T_list[instance] > 0 else 1e-10
+        gamma_x = (sum_cos_x / N_b) - (sum_sin2_x / (T_inst * N_b))
+        gamma_y = (sum_cos_y / N_b) - (sum_sin2_y / (T_inst * N_b))
+        gamma[instance] = 0.5 * (gamma_x + gamma_y)
+    return gamma
+
+def generate_dataset(n, Steps, tmax, L=25, M=25, delta_max=math.pi/4):
+    T_list = generate_temperatures(n, tmax)
+    configurations = initialize_configurations(n, L, M)
+    configurations = metropolis_xy_numba(configurations, T_list, Steps, delta_max)
+    gamma_arr = helicity_modulus_numba(configurations, T_list)
+    data = configurations.reshape(n, L * M)
+    T_arr = np.array(T_list)
+    gamma_arr = np.array(gamma_arr)
+    return T_arr, gamma_arr, data
+
+def generate_fixed_dataset(n, Steps, T_fixed, L=25, M=25, delta_max=math.pi/4):
+    T_list = T_fixed * np.ones(n)
+    configurations = initialize_configurations(n, L, M)
+    configurations = metropolis_xy_numba(configurations, T_list, Steps, delta_max)
+    gamma_arr = helicity_modulus_numba(configurations, T_list)
+    data = configurations.reshape(n, L * M)
+    T_arr = np.array(T_list)
+    gamma_arr = np.array(gamma_arr)
+    return T_arr, gamma_arr, data
+
+# ------------------------------
+# SOM TRAINING FOR THE XY MODEL (BATCH METHOD) - USING NUMBA FOR OPTIMIZATION
+# ------------------------------
+
+NUM_NEURONS = 225   # SOM: 15 x 15
+WEIGHT_DIM = 625    # each configuration flattened from 25x25 grid has 625 elements
+
+def circular_diff(x, y):
+    d = abs(x - y) % (2 * math.pi)
+    return d if d <= math.pi else 2 * math.pi - d
+
+class Neuron:
+    def __init__(self, x, y, weights):
+        self.x = x
+        self.y = y
+        self.weights = weights[:]  # vector of dimension WEIGHT_DIM, angles in [0,2π)
+        self.distance = 0.0
+        self.flag = 0
+
+class Signal:
+    def __init__(self, config_flat):
+        self.signal = config_flat[:]  # flattened vector of dimension WEIGHT_DIM
+
+class BestUnitMatch:
+    def __init__(self, X=0, Y=0, weights=None):
+        self.X = X
+        self.Y = Y
+        self.weights = weights[:] if weights is not None else [0.0] * WEIGHT_DIM
+
+def random_angle_som():
+    return random.uniform(0, 2 * math.pi)
+
+def initialize_neurons():
+    neurons = []
+    for i in range(15):
+        for j in range(15):
+            weights = [random_angle_som() for _ in range(WEIGHT_DIM)]
+            neurons.append(Neuron(x=i, y=j, weights=weights))
+    return neurons
+
+def best_match(neurons, input_signal):
+    for neuron in neurons:
+        diff_sq_sum = 0.0
+        for inp, w in zip(input_signal.signal, neuron.weights):
+            d = circular_diff(inp, w)
+            diff_sq_sum += d * d
+        neuron.distance = math.sqrt(diff_sq_sum)
+    min_distance = min(neuron.distance for neuron in neurons)
+    best_indices = [i for i, neuron in enumerate(neurons) if math.isclose(neuron.distance, min_distance, rel_tol=1e-9)]
+    chosen = neurons[random.choice(best_indices)]
+    return BestUnitMatch(X=chosen.x, Y=chosen.y, weights=chosen.weights)
+
+def torus_distance(neuron, bmu):
+    L_map = 15
+    dx = min(abs(neuron.x - bmu.X), L_map - abs(neuron.x - bmu.X))
+    dy = min(abs(neuron.y - bmu.Y), L_map - abs(neuron.y - bmu.Y))
+    return math.sqrt(dx * dx + dy * dy)
+
+def neighborhood_function(neuron, bmu, s):
+    r = torus_distance(neuron, bmu)
+    return math.exp(- (r * r) / (2 * s * s))
+
+def train_SOM_batch(training_data, s0=1.0, initial_step=7):
+    n_samples = training_data.shape[0]
+    signals = [Signal(config_flat=list(training_data[i])) for i in range(n_samples)]
+    neurons = initialize_neurons()
+    bmu_list = [None] * n_samples
+    h_matrix = [[0.0 for _ in range(NUM_NEURONS)] for _ in range(n_samples)]
+    step = initial_step
+    s = step * s0 + 0.5
+    print("Batch SOM training initialized successfully.")
+    while step > 3:
+        for i in range(n_samples):
+            bmu_list[i] = best_match(neurons, signals[i])
+        for i in range(n_samples):
+            for j in range(NUM_NEURONS):
+                h_matrix[i][j] = neighborhood_function(neurons[j], bmu_list[i], s)
+        for weight_index in range(WEIGHT_DIM):
+            for neuron_index in range(NUM_NEURONS):
+                sum_h = sum(h_matrix[k][neuron_index] for k in range(n_samples))
+                if sum_h == 0:
+                    new_weight = random_angle_som()
+                else:
+                    sum_h_complex = sum(h_matrix[k][neuron_index] * complex(math.cos(signals[k].signal[weight_index]),
+                                                                             math.sin(signals[k].signal[weight_index]))
+                                        for k in range(n_samples))
+                    new_weight = math.atan2(sum_h_complex.imag, sum_h_complex.real) % (2 * math.pi)
+                neurons[neuron_index].weights[weight_index] = new_weight
+        step -= 1
+        s = step * s0 + 0.5
+        print(f"Batch iteration completed, current step = {step}")
+    print("Batch SOM training completed.")
+    som_weights = np.empty((15, 15, WEIGHT_DIM))
+    for neuron in neurons:
+        som_weights[neuron.x, neuron.y, :] = neuron.weights
+    return som_weights
+
+def get_fixed_temperatures():
+    temps1 = np.arange(0, 0.6 + 0.1, 0.1)
+    temps2 = np.arange(0.6 + 0.005, 1 + 0.005/2, 0.005)
+    temps3 = np.arange(1, 2 + 0.1, 0.1)
+    temps4 = np.arange(2, 8 + 0.2, 0.2)
+    temps5 = np.arange(8, 20 + 0.5, 0.5)
+    fixed = np.unique(np.concatenate((temps1, temps2, temps3, temps4, temps5)))
+    return fixed
+
+def generate_fixed_test_signals(n_conf_per_signal, Steps, L=25, M=25, delta_max=math.pi/4):
+    fixed_temps = get_fixed_temperatures()
+    test_signals = []
+    for T_fixed in fixed_temps:
+        _, _, data = generate_fixed_dataset(n_conf_per_signal, Steps, T_fixed, L, M, delta_max)
+        test_signals.append(data)
+    return np.array(fixed_temps), test_signals
+
+def evaluate_signal(som_weights, signal_data, map_height=15, map_width=15):
+    n_conf = signal_data.shape[0]
+    bmu_set = set()
+    for s in range(n_conf):
+        bmu = find_bmu(signal_data[s], som_weights)
+        i, j = bmu
+        bmu_idx = i * map_width + j
+        bmu_set.add(bmu_idx)
+    return len(bmu_set)
+
+def find_bmu(x, som_weights):
+    x_broadcast = x.reshape(1, 1, -1)
+    diff = np.abs(som_weights - x_broadcast) % (2 * np.pi)
+    diff = np.where(diff > np.pi, 2 * np.pi - diff, diff)
+    dist_sq = np.sum(diff**2, axis=2)
+    return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
+
+def main():
+    introduction()
+    random.seed(int(time.time()))
+    np.random.seed(int(time.time()))
+
+    print("=== Phase 1: Generation of the training dataset ===")
+    n_train = 10000
+    Steps = 100
+    tmax = 8
+    L = 25
+    M = 25
+    delta_max = math.pi / 4
+    T_train, gamma_train, training_data = generate_dataset(n_train, Steps, tmax, L, M, delta_max)
+    print(f"Generated training dataset with {len(T_train)} configurations (after filtering).")
+
+    plt.figure(figsize=(8, 6))
+    plt.scatter(T_train, gamma_train, c='blue', marker='o', s=5, alpha=0.7)
+    plt.xlabel("Temperature T")
+    plt.ylabel("Helicity modulus γ")
+    plt.title("Training data")
+    plt.grid(True)
+    plt.show()
+
+    print("=== Phase 2: Training the SOM ===")
+    som_weights = train_SOM_batch(training_data)
+
+    print("=== Phase 3: Generation of test signals at fixed temperatures ===")
+    n_conf_per_signal = 1000
+    T_test, test_signals = generate_fixed_test_signals(n_conf_per_signal, Steps, L, M, delta_max)
+    print(f"Generated {len(T_test)} test signals (each with up to {n_conf_per_signal} configurations, filtered if necessary).")
+
+    print("=== Phase 4: Evaluation of neural activity per signal ===")
+    activated_neurons = []
+    for idx, signal_data in enumerate(test_signals):
+        count = evaluate_signal(som_weights, signal_data, map_height=15, map_width=15)
+        activated_neurons.append(count)
+    activated_neurons = np.array(activated_neurons)
+    # Calculate fraction of activated neurons (out of total 225 neurons)
+    fraction_activated = activated_neurons / 225.0
+    indices = np.argsort(T_test)
+    T_test_sorted = T_test[indices]
+    fraction_sorted = fraction_activated[indices]
+
+    plt.figure(figsize=(8, 6))
+    plt.plot(T_test_sorted, fraction_sorted, marker='o', linestyle='-')
+    plt.xlabel("Signal temperature")
+    plt.ylabel("Number of activated neurons")
+    plt.title("Neural activity")
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
