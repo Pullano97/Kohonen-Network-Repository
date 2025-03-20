@@ -95,34 +95,34 @@ def metropolis(potts, Plus, Minus, T, n, N, M, Steps, J, q):
 
 def average_magnetization(m, potts, n, N, M, q):
     """
-    Calcola la magnetizzazione 'vettoriale' per il modello di Potts:
-      - Rappresenta ciascuno stato 1..q come un vettore unitario in un poligono regolare di q lati;
-      - Somma tutti i vettori della configurazione e dividi per (N*M);
-      - La magnetizzazione scalare è il modulo di questo vettore medio, in [0,1].
+    Computes the 'vector' magnetization for the Potts model:
+      - Represents each state 1..q as a unit vector in a regular polygon with q sides;
+      - Sums all the configuration’s vectors and divides by (N*M);
+      - The scalar magnetization is the magnitude of this average vector, in [0,1].
 
-    Parametri
+    Parameters
     ----------
-    m : array-like, dimensione (n,)
-        Array dove salvare il valore della magnetizzazione per ciascuna configurazione.
-    potts : lista (o array) di dimensione [n][N][M]
-        Contiene le n configurazioni, ognuna di dimensione N x M,
-        con stati in {1,2,...,q}.
+    m : array-like, shape (n,)
+        Array in which the magnetization value for each configuration is stored.
+    potts : list (or array) with dimensions [n][N][M]
+        Contains the n configurations, each of size N x M,
+        with states in {1,2,...,q}.
     n : int
-        Numero di configurazioni.
+        Number of configurations.
     N, M : int
-        Dimensioni della griglia (es. 25 e 25).
+        Dimensions of the grid (e.g., 25 and 25).
     q : int
-        Numero di stati del modello di Potts (es. 3).
+        Number of states in the Potts model (e.g., 3).
 
-    Risultato
-    ---------
+    Returns
+    -------
     m[i] : float
-        Valore della magnetizzazione per la configurazione i-esima, in [0,1].
+        The magnetization value for the i-th configuration, in [0,1].
     """
 
-    # Precompute i vettori corrispondenti a ciascuno stato (1..q)
-    # v[k] sarà un tuple (v_x, v_y) del vettore unitario associato a k
-    # Uso (k-1) per far partire l'angolo da 0 per lo stato 1.
+    # Precompute the vectors corresponding to each state (1..q)
+    # v[k] will be a tuple (v_x, v_y) of the unit vector associated with state k.
+    # Using (k-1) to start the angle at 0 for state 1.
     v = []
     for k in range(1, q+1):
         angle = 2.0 * math.pi * (k-1) / q
@@ -130,24 +130,24 @@ def average_magnetization(m, potts, n, N, M, q):
 
     tot = N * M
 
-    # Calcolo della magnetizzazione per ciascuna configurazione
+    # Compute the magnetization for each configuration
     for instance in range(n):
         M_x = 0.0
         M_y = 0.0
-        # Somma vettoriale
+        # Vector sum
         for i in range(N):
             for j in range(M):
-                # s è lo stato in {1..q}
+                # s is the state in {1..q}
                 s = potts[instance][i][j]
-                # Aggiungiamo il vettore corrispondente
+                # Add the corresponding vector
                 M_x += v[s-1][0]
                 M_y += v[s-1][1]
 
-        # Media (vettore medio) = (M_x, M_y) / (N*M)
+        # Average (mean vector) = (M_x, M_y) / (N*M)
         M_x /= tot
         M_y /= tot
 
-        # Modulo della magnetizzazione vettoriale
+        # Magnitude of the vector magnetization
         m[instance] = math.sqrt(M_x*M_x + M_y*M_y)
 
 def filter_configurations(T, m, data):
