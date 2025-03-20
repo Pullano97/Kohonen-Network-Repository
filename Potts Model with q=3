@@ -1,0 +1,397 @@
+"""
+------------------
+This program performs four phases for the Potts model (q=3) in D=2:
+
+1) It generates a dataset of 25×25 configurations thermalized at random temperatures in [0, tmax].
+   For each configuration, the "magnetization" is calculated as the fraction of sites
+   that assume the most common state.
+   A scatter plot (magnetization vs. T) and a lattice heatmap are displayed.
+2) It trains a Self-Organizing Map (SOM 15×15) using the batch method.
+3) It generates test signals at fixed temperatures. The list of temperatures is manually defined:
+       - from 0 to 0.9 with step 0.1,
+       - from 0.9 to 1.1 with step 0.005,
+       - from 1.1 to 4 with step 0.1,
+       - from 4 to 10 with step 0.2,
+       - from 10 to 20 with step 0.5.
+4) For each signal, the number of distinct neurons (unique BMUs) activated by the SOM is calculated,
+   and the plot "activated neurons vs. Temperature" is drawn.
+
+In the Potts model the system is described by the Hamiltonian:
+    H(S) = -J ∑⟨i,j⟩ δ(s_i, s_j)
+with s_i ∈ {1, 2, 3}. For J=1, the critical temperature is:
+    T_c = 1/ln(1+√3) ≈ 0.995.
+"""
+
+import random
+import math
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ------------------------------
+# FUNCTIONS FOR GENERATING THE DATASET OF THE POTTS MODEL (q=3)
+# ------------------------------
+
+def intro():
+    print("This program generates configurations of the Potts model (25x25, q=3) thermalized at random temperatures for training")
+    print("and test signals at fixed temperatures (manually defined list).")
+    print("Phase 1: Configurations at T ∈ [0, tmax] for training (scatter plot of magnetization vs. T and heatmap).")
+    print("Phase 2: Training of a SOM (15x15) using the batch method.")
+    print("Phase 3: Generation of test signals at fixed temperatures.")
+    print("Phase 4: Plot of activated neurons (unique BMUs) vs. Temperature.")
+    print("In the Potts model (q=3) the continuous transition occurs around T_c ≈ 0.995.\n")
+
+def random_value():
+    return random.random()
+
+def potts_spin(q):
+    # Returns a random state from the set {1,2,...,q}
+    return random.randint(1, q)
+
+def initialize_lattices(potts, n, N, M, q):
+    for instance in range(n):
+        for i in range(N):
+            for j in range(M):
+                potts[instance][i][j] = potts_spin(q)
+
+def assign_temperatures(T, n, tmax):
+    for i in range(n):
+        T[i] = random_value() * tmax
+
+def set_boundaries(Plus, Minus, N):
+    for i in range(N):
+        Plus[i] = i + 1
+        Minus[i] = i - 1
+    Plus[N - 1] = 0
+    Minus[0] = N - 1
+
+def metropolis(potts, Plus, Minus, T, n, N, M, Steps, J, q):
+    # Metropolis algorithm for the Potts model
+    for instance in range(n):
+        beta = 1.0 / T[instance] if T[instance] > 0 else 1.0
+        for sweep in range(Steps):
+            for i in range(N):
+                for j in range(M):
+                    current_spin = potts[instance][i][j]
+                    # Define the list of possible states excluding the current one
+                    possible = [s for s in range(1, q+1) if s != current_spin]
+                    new_spin = random.choice(possible)
+
+                    # Consider the 4 neighbors (with periodic boundary conditions)
+                    dx = potts[instance][Plus[i]][j]
+                    sx = potts[instance][Minus[i]][j]
+                    up = potts[instance][i][Minus[j]]
+                    down = potts[instance][i][Plus[j]]
+                    neighbors = [dx, sx, up, down]
+
+                    # Count how many neighbors match the current spin and the proposed spin
+                    n_old = sum(1 for neighbor in neighbors if neighbor == current_spin)
+                    n_new = sum(1 for neighbor in neighbors if neighbor == new_spin)
+
+                    deltaE = -J * (n_new - n_old)
+
+                    if deltaE <= 0 or random_value() < math.exp(-beta * deltaE):
+                        potts[instance][i][j] = new_spin
+
+def average_magnetization(m, potts, n, N, M, q):
+    """
+    Calcola la magnetizzazione 'vettoriale' per il modello di Potts:
+      - Rappresenta ciascuno stato 1..q come un vettore unitario in un poligono regolare di q lati;
+      - Somma tutti i vettori della configurazione e dividi per (N*M);
+      - La magnetizzazione scalare è il modulo di questo vettore medio, in [0,1].
+
+    Parametri
+    ----------
+    m : array-like, dimensione (n,)
+        Array dove salvare il valore della magnetizzazione per ciascuna configurazione.
+    potts : lista (o array) di dimensione [n][N][M]
+        Contiene le n configurazioni, ognuna di dimensione N x M,
+        con stati in {1,2,...,q}.
+    n : int
+        Numero di configurazioni.
+    N, M : int
+        Dimensioni della griglia (es. 25 e 25).
+    q : int
+        Numero di stati del modello di Potts (es. 3).
+
+    Risultato
+    ---------
+    m[i] : float
+        Valore della magnetizzazione per la configurazione i-esima, in [0,1].
+    """
+
+    # Precompute i vettori corrispondenti a ciascuno stato (1..q)
+    # v[k] sarà un tuple (v_x, v_y) del vettore unitario associato a k
+    # Uso (k-1) per far partire l'angolo da 0 per lo stato 1.
+    v = []
+    for k in range(1, q+1):
+        angle = 2.0 * math.pi * (k-1) / q
+        v.append((math.cos(angle), math.sin(angle)))
+
+    tot = N * M
+
+    # Calcolo della magnetizzazione per ciascuna configurazione
+    for instance in range(n):
+        M_x = 0.0
+        M_y = 0.0
+        # Somma vettoriale
+        for i in range(N):
+            for j in range(M):
+                # s è lo stato in {1..q}
+                s = potts[instance][i][j]
+                # Aggiungiamo il vettore corrispondente
+                M_x += v[s-1][0]
+                M_y += v[s-1][1]
+
+        # Media (vettore medio) = (M_x, M_y) / (N*M)
+        M_x /= tot
+        M_y /= tot
+
+        # Modulo della magnetizzazione vettoriale
+        m[instance] = math.sqrt(M_x*M_x + M_y*M_y)
+
+def filter_configurations(T, m, data):
+    # For the Potts model, no filtering is applied (optional)
+    return T, m, data
+
+def generate_dataset(n, Steps, tmax, N=25, M=25, J=1.0, q=3):
+    T = [0.0] * 10000
+    m = [0.0] * 10000
+    Plus = [0] * N
+    Minus = [0] * N
+    set_boundaries(Plus, Minus, N)
+    assign_temperatures(T, n, tmax)
+    potts = []
+    for _ in range(n):
+        config = [[0 for _ in range(M)] for _ in range(N)]
+        potts.append(config)
+    initialize_lattices(potts, n, N, M, q)
+    metropolis(potts, Plus, Minus, T, n, N, M, Steps, J, q)
+    average_magnetization(m, potts, n, N, M, q)
+    data = np.array([np.array(config).flatten().astype(float) for config in potts])
+    T = np.array(T[:n])
+    m = np.array(m[:n])
+    T, m, data = filter_configurations(T, m, data)
+    return T, m, data, potts
+
+def generate_fixed_dataset(n, Steps, T_fixed, N=25, M=25, J=1.0, q=3):
+    T = [T_fixed] * n
+    m = [0.0] * n
+    Plus = [0] * N
+    Minus = [0] * N
+    set_boundaries(Plus, Minus, N)
+    potts = []
+    for _ in range(n):
+        config = [[0 for _ in range(M)] for _ in range(N)]
+        potts.append(config)
+    initialize_lattices(potts, n, N, M, q)
+    metropolis(potts, Plus, Minus, T, n, N, M, Steps, J, q)
+    average_magnetization(m, potts, n, N, M, q)
+    data = np.array([np.array(config).flatten().astype(float) for config in potts])
+    T = np.array(T)
+    m = np.array(m)
+    T, m, data = filter_configurations(T, m, data)
+    return T, m, data
+
+# ------------------------------
+# SOM SECTION: CLASSES AND FUNCTIONS FOR BATCH TRAINING
+# (Training operates on vectors of dimension 625)
+# ------------------------------
+
+NUM_NEURONS = 225   # 15x15
+DIM_WEIGHTS = 625
+
+class Neuron:
+    def __init__(self, x, y, weights):
+        self.x = x
+        self.y = y
+        self.weights = weights[:]
+        self.distance = 0.0
+        self.flag = 0
+
+class Signal:
+    def __init__(self, potts):
+        self.potts = potts[:]
+
+class BestUnitMatch:
+    def __init__(self, X=0, Y=0, Weights=None):
+        self.X = X
+        self.Y = Y
+        self.Weights = Weights[:] if Weights is not None else [0.0] * DIM_WEIGHTS
+
+def som_spin():
+    return -1.0 if random.randrange(2) == 0 else 1.0
+
+def init_neurons():
+    neurons = []
+    for i in range(15):
+        for j in range(15):
+            weights = [som_spin() for _ in range(DIM_WEIGHTS)]
+            neurons.append(Neuron(x=i, y=j, weights=weights))
+    return neurons
+
+def best_match(neurons, input_signal):
+    n = len(neurons)
+    for neuron in neurons:
+        diff_sq_sum = sum((inp - w) ** 2 for inp, w in zip(input_signal.potts, neuron.weights))
+        neuron.distance = math.sqrt(diff_sq_sum)
+    bingo = random.randrange(n)
+    for i in range(n):
+        if neurons[i].distance < neurons[bingo].distance:
+            bingo = i
+    best_neuron = neurons[bingo]
+    return BestUnitMatch(X=best_neuron.x, Y=best_neuron.y, Weights=best_neuron.weights)
+
+def neighborhood_radius(neuron, bmu):
+    L = 15
+    a = min((neuron.x - bmu.X) ** 2, (abs(neuron.x - bmu.X - L)) ** 2)
+    b = min((neuron.y - bmu.Y) ** 2, (abs(neuron.y - bmu.Y - L)) ** 2)
+    return math.sqrt(a + b)
+
+def neighborhood(neuron, bmu, s):
+    r_sq = neighborhood_radius(neuron, bmu) ** 2
+    return math.exp(-r_sq / (2 * s * s))
+
+def train_SOM_batch(training_data, s0=1.0, initial_step=7):
+    n_samples = training_data.shape[0]
+    signals = [Signal(potts=list(training_data[i])) for i in range(n_samples)]
+    neurons = init_neurons()
+    bmu_list = [None] * n_samples
+    h_matrix = [[0.0 for _ in range(NUM_NEURONS)] for _ in range(n_samples)]
+
+    step = initial_step
+    s = step * s0 + 0.5
+    print("Batch SOM training initialized correctly.")
+    while step > 3:
+        for i in range(n_samples):
+            bmu_list[i] = best_match(neurons, signals[i])
+        for i in range(n_samples):
+            for j in range(NUM_NEURONS):
+                h_matrix[i][j] = neighborhood(neurons[j], bmu_list[i], s)
+        for weight_index in range(DIM_WEIGHTS):
+            for neuron_index in range(NUM_NEURONS):
+                sum_h = sum(h_matrix[k][neuron_index] for k in range(n_samples))
+                if sum_h == 0:
+                    new_weight = 0
+                else:
+                    sum_h_potts = sum(h_matrix[k][neuron_index] * signals[k].potts[weight_index] for k in range(n_samples))
+                    new_weight = sum_h_potts / sum_h
+                neurons[neuron_index].weights[weight_index] = new_weight
+        step -= 1
+        s = step * s0 + 0.5
+        print(f"Batch iteration completed, current step = {step}")
+    print("Batch SOM training completed.")
+    som_weights = np.empty((15, 15, DIM_WEIGHTS))
+    for neuron in neurons:
+        som_weights[neuron.x, neuron.y, :] = neuron.weights
+    return som_weights
+
+# ------------------------------
+# TEST SECTION: GENERATION OF TEST SIGNALS AT FIXED TEMPERATURES
+# ------------------------------
+
+def get_fixed_temperatures():
+    """
+    Manually compile the list of fixed temperatures according to the following steps:
+      - from 0 to 0.9 with step 0.1,
+      - from 0.9 to 1.1 with step 0.005,
+      - from 1.1 to 4 with step 0.1,
+      - from 4 to 10 with step 0.2,
+      - from 10 to 20 with step 0.5.
+    """
+    temps1 = np.arange(0, 0.9 + 0.1, 0.1)
+    temps2 = np.arange(0.9, 1.1 + 0.005, 0.005)
+    temps3 = np.arange(1.1, 4 + 0.1, 0.1)
+    temps4 = np.arange(4, 10 + 0.2, 0.2)
+    temps5 = np.arange(10, 20 + 0.5, 0.5)
+    fixed_temps = np.unique(np.concatenate([temps1, temps2, temps3, temps4, temps5]))
+    return fixed_temps
+
+def generate_test_signals_fixed(n_conf_per_signal, Steps, N=25, M=25, J=1.0, q=3):
+    fixed_temps = get_fixed_temperatures()
+    test_signals = []
+    for T_fixed in fixed_temps:
+        _, _, data = generate_fixed_dataset(n_conf_per_signal, Steps, T_fixed, N, M, J, q)
+        test_signals.append(data)
+    return np.array(fixed_temps), test_signals
+
+# ------------------------------
+# PHASE 4: EVALUATION OF NEURAL ACTIVITY PER SIGNAL
+# ------------------------------
+
+def evaluate_signal(som_weights, signal_data, map_height=15, map_width=15):
+    n_conf = signal_data.shape[0]
+    bmu_set = set()
+    def find_bmu(x, weights):
+        diff = weights - x
+        dist_sq = np.sum(diff ** 2, axis=2)
+        return np.unravel_index(np.argmin(dist_sq, axis=None), dist_sq.shape)
+    for s in range(n_conf):
+        bmu = find_bmu(signal_data[s], som_weights)
+        i, j = bmu
+        bmu_set.add(i * map_width + j)
+    return len(bmu_set)
+
+# ------------------------------
+# MAIN
+# ------------------------------
+
+def main():
+    intro()
+    random.seed(int(time.time()))
+
+    # --- Phase 1: Generate training dataset for the Potts model (q=3) ---
+    print("=== Phase 1: Generating training dataset for the Potts model (q=3) ===")
+    n_train = 10000   # e.g., 10,000 configurations
+    Steps = 100       # number of sweeps per configuration
+    J = 1.0
+    q = 3             # Set q=3; the continuous transition occurs around T_c ≈ 0.995
+    tmax = 8          # Temperature range for training: [0, tmax]
+    T_train, m_train, training_data, train_configurations = generate_dataset(n_train, Steps, tmax, N=25, M=25, J=J, q=q)
+    print(f"Generated training dataset with {n_train} configurations (after any filtering).")
+
+    # Scatter plot: Magnetization vs. Temperature (Training)
+    plt.figure(figsize=(8,6))
+    plt.scatter(T_train, m_train, c='blue', marker='o', s=5, alpha=0.7)
+    plt.xlabel("Temperature T")
+    plt.ylabel("Magnetization m")
+    plt.title("Training data")
+    plt.grid(True)
+    plt.show()
+
+    # --- Phase 2: Train the SOM (Batch Method) ---
+    print("=== Phase 2: Training the SOM (Batch Method) ===")
+    som_weights = train_SOM_batch(training_data, s0=1.0, initial_step=7)
+
+    # --- Phase 3: Generate test signals at fixed temperatures ---
+    print("=== Phase 3: Generating test signals at fixed temperatures ===")
+    n_conf_per_signal = 1000
+    T_test, test_signals = generate_test_signals_fixed(n_conf_per_signal, Steps, N=25, M=25, J=J, q=q)
+    print(f"Generated {len(T_test)} test signals (each with up to {n_conf_per_signal} configurations, after any filtering).")
+
+    # --- Phase 4: Evaluate neural activity per signal ---
+    print("=== Phase 4: Evaluating neural activity per signal ===")
+    activated_neurons = []
+    for signal_data in test_signals:
+        count = evaluate_signal(som_weights, signal_data, map_height=15, map_width=15)
+        activated_neurons.append(count)
+    activated_neurons = np.array(activated_neurons)
+
+    # Calculate fraction of activated neurons (out of total 225 neurons)
+    fraction_activated = activated_neurons / 225.0
+
+    # Sort the signals by temperature for plotting
+    indices = np.argsort(T_test)
+    T_test_sorted = T_test[indices]
+    fraction_sorted = fraction_activated[indices]
+
+    plt.figure(figsize=(8,6))
+    plt.plot(T_test_sorted, fraction_sorted, marker='o', linestyle='-')
+    plt.xlabel("Signal temperature")
+    plt.ylabel("Fraction of activated neurons")
+    plt.title("Neural activity")
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
