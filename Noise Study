@@ -1,0 +1,298 @@
+import random
+import math
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ------------------------------
+# FUNCTIONS FOR GENERATING THE ISING DATASET
+# ------------------------------
+
+def intro():
+    print("This program generates 25×25 Ising configurations thermalized at random temperatures for training")
+    print("and test signals at fixed temperatures (171 temperatures, 1000 configurations each).")
+    print("Phase 1: 10,000 configurations at T ∈ [0,8] for training (scatter plot m vs. T).")
+    print("Phase 2: Training a 15×15 SOM using the batch method.")
+    print("Phase 3: Generating test signals at fixed temperatures.")
+    print("Phase 4: Evaluating neural activity for original and perturbed signals.\n")
+
+def random_case():
+    return random.random()
+
+def spin():
+    return 1 if random_case() > 0.5 else -1
+
+def initialize_grids(ising, n, N, M):
+    for idx in range(n):
+        for i in range(N):
+            for j in range(M):
+                ising[idx][i][j] = spin()
+
+def assign_temperatures(T, n, tmax):
+    for i in range(n):
+        T[i] = random_case() * tmax
+
+def set_borders(Plus, Minus, N):
+    for i in range(N):
+        Plus[i] = i + 1
+        Minus[i] = i - 1
+    Plus[N - 1] = 0
+    Minus[0] = N - 1
+
+def metropolis(ising, Plus, Minus, T, n, N, M, Steps):
+    for idx in range(n):
+        beta = 1.0 / T[idx]
+        for _ in range(Steps):
+            for i in range(N):
+                for j in range(M):
+                    s_old = ising[idx][i][j]
+                    s_new = -s_old
+                    neighborhood_sum = (
+                        ising[idx][Plus[i]][j] +
+                        ising[idx][Minus[i]][j] +
+                        ising[idx][i][Plus[j]] +
+                        ising[idx][i][Minus[j]]
+                    )
+                    delta_E = -s_new * neighborhood_sum - (-s_old * neighborhood_sum)
+                    if delta_E <= 0 or random_case() < math.exp(-beta * delta_E):
+                        ising[idx][i][j] = s_new
+
+def average_magnetization(m, ising, n, N, M):
+    total_sites = N * M
+    for idx in range(n):
+        m[idx] = sum(ising[idx][i][j] for i in range(N) for j in range(M)) / total_sites
+
+def filter_configurations(T, m, data):
+    mask = ~((T >= 0) & (T <= 2) & (m >= -0.85) & (m <= 0.85))
+    return T[mask], m[mask], data[mask]
+
+def generate_dataset(n, Steps, tmax, N=25, M=25):
+    T = [0.0] * n
+    m = [0.0] * n
+    Plus = [0] * N
+    Minus = [0] * N
+    set_borders(Plus, Minus, N)
+    assign_temperatures(T, n, tmax)
+    ising = [[[0 for _ in range(M)] for _ in range(N)] for _ in range(n)]
+    initialize_grids(ising, n, N, M)
+    metropolis(ising, Plus, Minus, T, n, N, M, Steps)
+    average_magnetization(m, ising, n, N, M)
+    data = np.array([np.array(config).flatten().astype(float) for config in ising])
+    T = np.array(T)
+    m = np.array(m)
+    T, m, data = filter_configurations(T, m, data)
+    return T, m, data
+
+def generate_fixed_dataset(n, Steps, T_fixed, N=25, M=25):
+    T = [T_fixed] * n
+    m = [0.0] * n
+    Plus = [0] * N
+    Minus = [0] * N
+    set_borders(Plus, Minus, N)
+    ising = [[[0 for _ in range(M)] for _ in range(N)] for _ in range(n)]
+    initialize_grids(ising, n, N, M)
+    metropolis(ising, Plus, Minus, T, n, N, M, Steps)
+    average_magnetization(m, ising, n, N, M)
+    data = np.array([np.array(config).flatten().astype(float) for config in ising])
+    T = np.array(T)
+    m = np.array(m)
+    T, m, data = filter_configurations(T, m, data)
+    return T, m, data
+
+# ------------------------------
+# CLASSES AND FUNCTIONS FOR SOM TRAINING (BATCH METHOD)
+# ------------------------------
+
+NUM_NEURONS = 225   # 15 × 15
+WEIGHT_DIM = 625   # 25 × 25
+
+class Neuron:
+    def __init__(self, x, y, weights):
+        self.x = x
+        self.y = y
+        self.weights = weights[:]
+        self.distance = 0.0
+
+class Signal:
+    def __init__(self, pattern):
+        self.pattern = pattern[:]
+
+def random_weight():
+    return -1.0 if random.randrange(2) == 0 else 1.0
+
+def init_neurons():
+    neurons = []
+    for i in range(15):
+        for j in range(15):
+            weights = [random_weight() for _ in range(WEIGHT_DIM)]
+            neurons.append(Neuron(i, j, weights))
+    return neurons
+
+def best_matching_unit(neurons, signal):
+    # Euclidean distance
+    for neuron in neurons:
+        neuron.distance = math.sqrt(
+            sum((inp - w)**2 for inp, w in zip(signal.pattern, neuron.weights))
+        )
+    min_dist = min(neuron.distance for neuron in neurons)
+    candidates = [neuron for neuron in neurons if abs(neuron.distance - min_dist) < 1e-12]
+    return random.choice(candidates)
+
+def grid_distance(neuron, bmu):
+    L = 15
+    dx = min((neuron.x - bmu.x)**2,
+             (neuron.x - bmu.x + L)**2,
+             (neuron.x - bmu.x - L)**2)
+    dy = min((neuron.y - bmu.y)**2,
+             (neuron.y - bmu.y + L)**2,
+             (neuron.y - bmu.y - L)**2)
+    return math.sqrt(dx + dy)
+
+def neighborhood_function(neuron, bmu, sigma):
+    r = grid_distance(neuron, bmu)
+    return math.exp(-r*r / (2 * sigma * sigma))
+
+def train_som_batch(data, sigma0=1.0, steps0=7):
+    signals = [Signal(list(data[i])) for i in range(data.shape[0])]
+    neurons = init_neurons()
+    steps = steps0
+    sigma = sigma0 * steps + 0.5
+    while steps > 3:
+        # 1) find BMUs for all signals
+        bmus = [best_matching_unit(neurons, sig) for sig in signals]
+        # 2) compute neighborhood functions
+        H = [
+            [neighborhood_function(neurons[j], bmus[i], sigma) for j in range(NUM_NEURONS)]
+            for i in range(len(signals))
+        ]
+        # 3) batch update of weights
+        for w in range(WEIGHT_DIM):
+            for j in range(NUM_NEURONS):
+                denom = sum(H[i][j] for i in range(len(signals)))
+                if denom > 0:
+                    numer = sum(H[i][j] * signals[i].pattern[w] for i in range(len(signals)))
+                    neurons[j].weights[w] = numer / denom
+        steps -= 1
+        sigma = sigma0 * steps + 0.5
+
+    som = np.zeros((15, 15, WEIGHT_DIM))
+    for neuron in neurons:
+        som[neuron.x, neuron.y, :] = neuron.weights
+    return som
+
+# ------------------------------
+# FUNCTIONS FOR SIGNALS AND NOISE
+# ------------------------------
+
+def get_fixed_temperatures():
+    base = np.linspace(0.05, 8.00, 142).tolist()
+    extras = [
+        8.2, 8.4, 8.6, 8.8, 9.0, 9.2, 9.4, 9.6, 9.8, 10.0,
+        10.3, 10.6, 10.9, 11.2, 11.5, 11.8, 12.2, 12.6,
+        13.0, 13.5, 14.0, 14.5, 15.0, 15.5, 16.0, 17.0, 18.0, 19.0, 20.0
+    ]
+    return base + extras
+
+def generate_test_signals(n_conf, Steps, N=25, M=25):
+    temps = get_fixed_temperatures()
+    signals = []
+    for T in temps:
+        _, _, data = generate_fixed_dataset(n_conf, Steps, T, N, M)
+        signals.append(data)
+    return np.array(temps), signals
+
+def apply_flip_noise(signals, p=0.05):
+    noisy = []
+    for data in signals:
+        df = data.copy()
+        mask = np.random.rand(*df.shape) < p
+        df[mask] *= -1
+        noisy.append(df)
+    return noisy
+
+def apply_gaussian_noise(signals, sigma=0.3):
+    return [data + np.random.normal(0, sigma, data.shape) for data in signals]
+
+def evaluate_signal(som, data):
+    activated = set()
+    for sample in data:
+        diff = som - sample
+        dist = np.sum(diff*diff, axis=2)
+        idx = np.unravel_index(np.argmin(dist), dist.shape)
+        activated.add(idx)
+    return len(activated)
+
+# ------------------------------
+# MAIN
+# ------------------------------
+
+def main():
+    intro()
+    random.seed(int(time.time()))
+
+    # Phase 1
+    print("=== Phase 1: generating training data ===")
+    n_train = 10000
+    Steps = 100
+    T_train, m_train, train_data = generate_dataset(n_train, Steps, 8)
+    print(f"Training: {len(T_train)} samples")
+    plt.scatter(T_train, m_train, s=5, alpha=0.7)
+    plt.xlabel("Temperature (T)")
+    plt.ylabel("Magnetization (m)")
+    plt.title("Training Data")
+    plt.grid(True)
+    plt.show()
+
+    # Phase 2
+    print("=== Phase 2: training SOM ===")
+    som_weights = train_som_batch(train_data)
+
+    # Phase 3
+    print("=== Phase 3: generating test signals ===")
+    T_test, test_signals = generate_test_signals(1000, 100)
+    test_flip = apply_flip_noise(test_signals, p=0.1)
+    test_gauss = apply_gaussian_noise(test_signals, sigma=0.5)
+    print("Original and perturbed signals generated.")
+
+    # Phase 4
+    print("=== Phase 4: evaluating neural activity ===")
+    orig_counts = np.array([evaluate_signal(som_weights, s) for s in test_signals])
+    flip_counts = np.array([evaluate_signal(som_weights, s) for s in test_flip])
+    gauss_counts = np.array([evaluate_signal(som_weights, s) for s in test_gauss])
+
+    orig_frac  = orig_counts / NUM_NEURONS
+    flip_frac  = flip_counts / NUM_NEURONS
+    gauss_frac = gauss_counts / NUM_NEURONS
+
+    idx = np.argsort(T_test)
+    Ts = T_test[idx]
+    o = orig_frac[idx]
+    f = flip_frac[idx]
+    g = gauss_frac[idx]
+
+    # Plot original signals
+    plt.plot(Ts, o, marker='o', linestyle='-', label='Original')
+    plt.xlabel("Signal Temperature")
+    plt.ylabel("Fraction of Activated Neurons")
+    plt.title("Neural Activity")
+    plt.grid(True)
+    plt.show()
+
+    # Plot flip noise
+    plt.plot(Ts, f, marker='o', linestyle='-', label='Flip p=10%')
+    plt.xlabel("Signal Temperature")
+    plt.ylabel("Fraction of Activated Neurons")
+    plt.title("Neural Activity – Flip Noise")
+    plt.grid(True)
+    plt.show()
+
+    # Plot Gaussian noise
+    plt.plot(Ts, g, marker='o', linestyle='-', label='Gaussian σ=0.5')
+    plt.xlabel("Signal Temperature")
+    plt.ylabel("Fraction of Activated Neurons")
+    plt.title("Neural Activity – Gaussian Noise")
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
