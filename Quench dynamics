@@ -1,0 +1,220 @@
+import random
+import math
+import time
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ------------------------------
+# FUNCTIONS FOR GENERATING ISING DATASET
+# ------------------------------
+def print_intro():
+    print("This program generates Ising configurations (25×25) for training")
+    print("and shows a case study of out-of-equilibrium thermal quench with SOM.\n")
+
+def random_value():
+    return random.random()
+
+def random_spin():
+    return 1 if random_value() > 0.5 else -1
+
+def init_grids(ising, num_samples, N, M):
+    for idx in range(num_samples):
+        for i in range(N):
+            for j in range(M):
+                ising[idx][i][j] = random_spin()
+
+def init_temperatures(T, num_samples, Tmax):
+    for i in range(num_samples):
+        T[i] = random_value() * Tmax
+
+def init_boundaries(Plus, Minus, N):
+    for i in range(N):
+        Plus[i] = (i + 1) % N
+        Minus[i] = (i - 1) % N
+
+def metropolis(ising, Plus, Minus, T, num_samples, N, M, steps):
+    for idx in range(num_samples):
+        beta = 1.0 / T[idx]
+        for _ in range(steps):
+            for i in range(N):
+                for j in range(M):
+                    current = ising[idx][i][j]
+                    flipped = -current
+                    neighbor_sum = (
+                        ising[idx][Plus[i]][j]
+                        + ising[idx][Minus[i]][j]
+                        + ising[idx][i][Plus[j]]
+                        + ising[idx][i][Minus[j]]
+                    )
+                    delta_E = -flipped * neighbor_sum - (-current * neighbor_sum)
+                    if delta_E <= 0 or random_value() < math.exp(-beta * delta_E):
+                        ising[idx][i][j] = flipped
+
+def compute_average_magnetization(m, ising, num_samples, N, M):
+    total_spins = N * M
+    for idx in range(num_samples):
+        m[idx] = sum(ising[idx][i][j] for i in range(N) for j in range(M)) / total_spins
+
+def filter_configurations(T, m, data):
+    mask = ~((T >= 0) & (T <= 2) & (m >= -0.85) & (m <= 0.85))
+    return T[mask], m[mask], data[mask]
+
+def generate_dataset(num_samples, steps, Tmax, N=25, M=25):
+    T = [0.0] * num_samples
+    m = [0.0] * num_samples
+    Plus = [0] * N
+    Minus = [0] * N
+    init_boundaries(Plus, Minus, N)
+    init_temperatures(T, num_samples, Tmax)
+    ising = [[[0] * M for _ in range(N)] for _ in range(num_samples)]
+    init_grids(ising, num_samples, N, M)
+    metropolis(ising, Plus, Minus, T, num_samples, N, M, steps)
+    compute_average_magnetization(m, ising, num_samples, N, M)
+    data = np.array([np.array(conf).flatten() for conf in ising])
+    T = np.array(T)
+    m = np.array(m)
+    return filter_configurations(T, m, data)
+
+# ------------------------------
+# SOM BATCH FUNCTIONS
+# ------------------------------
+NUM_NEURONS = 225
+WEIGHT_DIM = 625
+
+class Neuron:
+    def __init__(self, x, y, weights):
+        self.x = x
+        self.y = y
+        self.weights = weights[:]
+        self.distance = 0.0
+
+def random_spin_som():
+    return -1.0 if random.randrange(2) == 0 else 1.0
+
+def init_neurons():
+    neurons = []
+    for i in range(15):
+        for j in range(15):
+            weights = [random_spin_som() for _ in range(WEIGHT_DIM)]
+            neurons.append(Neuron(i, j, weights))
+    return neurons
+
+def best_match(neurons, vector):
+    for n in neurons:
+        n.distance = math.sqrt(sum((v - w) ** 2 for v, w in zip(vector, n.weights)))
+    min_dist = min(n.distance for n in neurons)
+    candidates = [n for n in neurons if abs(n.distance - min_dist) < 1e-12]
+    return random.choice(candidates)
+
+def radius(n, bmu):
+    L = 15
+    dx = min((n.x - bmu.x) ** 2, (n.x - bmu.x + L) ** 2, (n.x - bmu.x - L) ** 2)
+    dy = min((n.y - bmu.y) ** 2, (n.y - bmu.y + L) ** 2, (n.y - bmu.y - L) ** 2)
+    return math.sqrt(dx + dy)
+
+def neighborhood(n, bmu, sigma):
+    r = radius(n, bmu)
+    return math.exp(-r * r / (2 * sigma * sigma))
+
+def train_SOM_batch(data, sigma0=1.0, step0=7):
+    num_samples = data.shape[0]
+    signals = [data[i] for i in range(num_samples)]
+    neurons = init_neurons()
+    step = step0
+    sigma = sigma0 * step + 0.5
+    while step > 3:
+        bmus = [best_match(neurons, signals[i]) for i in range(num_samples)]
+        H = [[neighborhood(neurons[j], bmus[i], sigma) for j in range(NUM_NEURONS)]
+             for i in range(num_samples)]
+        for w in range(WEIGHT_DIM):
+            for j in range(NUM_NEURONS):
+                denom = sum(H[i][j] for i in range(num_samples))
+                if denom > 0:
+                    neurons[j].weights[w] = sum(
+                        H[i][j] * signals[i][w] for i in range(num_samples)
+                    ) / denom
+        step -= 1
+        sigma = sigma0 * step + 0.5
+    som = np.zeros((15, 15, WEIGHT_DIM))
+    for n in neurons:
+        som[n.x, n.y, :] = n.weights
+    return som
+
+# ------------------------------
+# EVALUATE NEURAL ACTIVITY
+# ------------------------------
+def evaluate_signal(som, data):
+    activated = set()
+    for sample in data:
+        diff = som - sample
+        dist = np.sum(diff * diff, axis=2)
+        idx = np.unravel_index(np.argmin(dist), dist.shape)
+        activated.add(idx)
+    return len(activated)
+
+# ------------------------------
+# CASE STUDY: OUT-OF-EQUILIBRIUM THERMAL QUENCH (STATISTICAL VERSION)
+# ------------------------------
+def quench_evolution_statistical(n_traj, N, M, Plus, Minus, som, T_low, steps_per_snap, num_snaps):
+    # initialize n_traj random grids
+    grids = [[[random_spin() for _ in range(M)] for _ in range(N)]
+             for _ in range(n_traj)]
+    R_t = []
+    for _ in range(num_snaps):
+        # perform steps_per_snap sweeps for each trajectory
+        metropolis(grids, Plus, Minus, [T_low] * n_traj, n_traj, N, M, steps_per_snap)
+        # collect snapshots
+        data = np.array([np.array(g).flatten() for g in grids])
+        # compute R(t)
+        active_count = evaluate_signal(som, data)
+        R_t.append(active_count / NUM_NEURONS)
+    return R_t
+
+# ------------------------------
+# MAIN
+# ------------------------------
+def main():
+    print_intro()
+    random.seed(int(time.time()))
+
+    # Phases 1-2: dataset generation and SOM training
+    print("=== Phases 1-2: Dataset generation and SOM training ===")
+    T_train, m_train, train_data = generate_dataset(10000, 100, 8)
+    plt.figure()
+    plt.scatter(T_train, m_train, c='blue', s=5, alpha=0.7)
+    plt.title("Training Data")
+    plt.xlabel("Temperature T")
+    plt.ylabel("Magnetization m")
+    plt.grid(True)
+    plt.show()
+
+    print("=== Training SOM batch ===")
+    som = train_SOM_batch(train_data, step0=7)
+
+    # Case study: out-of-equilibrium thermal quench
+    print("=== Case Study: Out-of-Equilibrium Thermal Quench ===")
+    N = M = 25
+    Plus = list(range(N))
+    Minus = list(range(N))
+    init_boundaries(Plus, Minus, N)
+
+    n_trajectories = 1000
+    T_low = 1
+    steps_snap = 10
+    snapshots = 200
+
+    R_time_stat = quench_evolution_statistical(
+        n_trajectories, N, M, Plus, Minus, som,
+        T_low, steps_snap, snapshots
+    )
+
+    plt.figure()
+    plt.plot(range(snapshots), R_time_stat, marker='o')
+    plt.title("Thermal Quench Dynamics")
+    plt.xlabel("Snapshot Index")
+    plt.ylabel("Fraction of Activated Neurons")
+    plt.grid(True)
+    plt.show()
+
+if __name__ == "__main__":
+    main()
